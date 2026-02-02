@@ -3,7 +3,8 @@
 
 [agent]
 # Default model to use for chat
-default_model = "gpt-4"
+# Use "claude-cli/opus", "claude-cli/sonnet", or "claude-cli/haiku" for Claude CLI
+default_model = "claude-cli/opus"
 
 # Context window size (in tokens)
 context_window = 128000
@@ -25,6 +26,12 @@ base_url = "https://api.openai.com/v1"
 # [providers.ollama]
 # endpoint = "http://localhost:11434"
 # model = "llama3"
+
+# Claude CLI configuration (uses local claude CLI command)
+# Requires claude CLI to be installed: https://github.com/anthropics/claude-code
+[providers.claude_cli]
+command = "claude"
+model = "opus"  # opus, sonnet, or haiku
 
 [heartbeat]
 # Enable automatic heartbeat

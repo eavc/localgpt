@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::pin::Pin;
+use std::sync::Mutex as StdMutex;
 use tracing::debug;
 
 use crate::config::Config;
@@ -87,6 +88,14 @@ pub trait LLMProvider: Send + Sync {
 }
 
 pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvider>> {
+    // Claude CLI: prefix "claude-cli/"
+    if model.starts_with("claude-cli/") {
+        let model_name = model.strip_prefix("claude-cli/").unwrap_or("opus");
+        let cli_config = config.providers.claude_cli.as_ref();
+        let command = cli_config.map(|c| c.command.as_str()).unwrap_or("claude");
+        return Ok(Box::new(ClaudeCliProvider::new(command, model_name)?));
+    }
+
     // Determine provider from model name
     if model.starts_with("gpt-") || model.starts_with("o1") {
         let openai_config = config
@@ -116,6 +125,12 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
         Ok(Box::new(OllamaProvider::new(
             &ollama_config.endpoint,
             model,
+        )?))
+    } else if let Some(cli_config) = &config.providers.claude_cli {
+        // Final fallback: try Claude CLI if configured
+        Ok(Box::new(ClaudeCliProvider::new(
+            &cli_config.command,
+            &cli_config.model,
         )?))
     } else {
         anyhow::bail!("Unknown model or provider not configured: {}", model)
@@ -640,4 +655,189 @@ impl LLMProvider for OllamaProvider {
 
         Ok(Box::pin(stream))
     }
+}
+
+/// Claude CLI Provider - invokes the `claude` CLI command
+/// No tool support (text in → text out only)
+/// No streaming (CLI output is collected then returned)
+pub struct ClaudeCliProvider {
+    command: String,
+    model: String,
+    /// Session ID for multi-turn conversations (interior mutability for &self methods)
+    session_id: StdMutex<Option<String>>,
+}
+
+impl ClaudeCliProvider {
+    pub fn new(command: &str, model: &str) -> Result<Self> {
+        Ok(Self {
+            command: command.to_string(),
+            model: normalize_claude_model(model),
+            session_id: StdMutex::new(None),
+        })
+    }
+}
+
+fn normalize_claude_model(model: &str) -> String {
+    match model.to_lowercase().as_str() {
+        "opus" | "opus-4.5" | "opus-4" | "claude-opus-4-5" => "opus",
+        "sonnet" | "sonnet-4.5" | "sonnet-4.1" | "claude-sonnet-4-5" => "sonnet",
+        "haiku" | "haiku-3.5" | "claude-haiku-3-5" => "haiku",
+        other => other,
+    }
+    .to_string()
+}
+
+fn build_prompt_from_messages(messages: &[Message]) -> String {
+    // Get the last user message as the prompt
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
+}
+
+fn extract_system_prompt(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .find(|m| m.role == Role::System)
+        .map(|m| m.content.clone())
+}
+
+/// Parse Claude CLI JSON output, returning (response_text, session_id)
+fn parse_claude_cli_output(stdout: &str) -> Result<(String, Option<String>)> {
+    // Claude CLI outputs JSON with message content and session info
+    if let Ok(json) = serde_json::from_str::<Value>(stdout) {
+        // Extract response text (try multiple field names)
+        let text = json
+            .get("result")
+            .or_else(|| json.get("message"))
+            .or_else(|| json.get("content"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| stdout.trim().to_string());
+
+        // Extract session ID (try multiple field names per OpenClaw pattern)
+        let session_id = json
+            .get("session_id")
+            .or_else(|| json.get("sessionId"))
+            .or_else(|| json.get("conversation_id"))
+            .or_else(|| json.get("conversationId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        return Ok((text, session_id));
+    }
+
+    // Fallback: return raw output, no session
+    Ok((stdout.trim().to_string(), None))
+}
+
+#[async_trait]
+impl LLMProvider for ClaudeCliProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: Option<&[ToolSchema]>, // Ignored - no tool support
+    ) -> Result<LLMResponse> {
+        use std::process::Command;
+
+        // Build prompt from messages (last user message)
+        let prompt = build_prompt_from_messages(messages);
+        let system_prompt = extract_system_prompt(messages);
+
+        // Get current session state
+        let current_session = self
+            .session_id
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Session lock poisoned: {}", e))?
+            .clone();
+        let is_first_turn = current_session.is_none();
+
+        // Build command args
+        let mut args = vec![
+            "-p".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
+
+        // Model (only on new sessions)
+        if is_first_turn {
+            args.push("--model".to_string());
+            args.push(self.model.clone());
+        }
+
+        // System prompt (first turn only)
+        if is_first_turn {
+            if let Some(sys) = system_prompt {
+                args.push("--append-system-prompt".to_string());
+                args.push(sys);
+            }
+        }
+
+        // Session handling
+        if let Some(session_id) = &current_session {
+            // Resume existing session
+            args.push("--resume".to_string());
+            args.push(session_id.clone());
+        } else {
+            // New session - generate UUID
+            let new_session = uuid::Uuid::new_v4().to_string();
+            args.push("--session-id".to_string());
+            args.push(new_session);
+        }
+
+        // Add prompt as final argument
+        args.push(prompt);
+
+        debug!("Claude CLI: {} {:?}", self.command, args);
+
+        // Execute command (blocking - wrap in spawn_blocking for async)
+        let output = tokio::task::spawn_blocking({
+            let command = self.command.clone();
+            let args = args.clone();
+            move || Command::new(&command).args(&args).output()
+        })
+        .await??;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Claude CLI failed: {}", stderr);
+        }
+
+        // Parse JSON output and extract session ID
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (response, new_session_id) = parse_claude_cli_output(&stdout)?;
+
+        // Update session ID for next turn
+        if let Some(sid) = new_session_id {
+            let mut session = self
+                .session_id
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Session lock poisoned: {}", e))?;
+            *session = Some(sid);
+        }
+
+        Ok(LLMResponse::Text(response))
+    }
+
+    async fn summarize(&self, text: &str) -> Result<String> {
+        let messages = vec![Message {
+            role: Role::User,
+            content: format!(
+                "Summarize the following conversation concisely:\n\n{}",
+                text
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        match self.chat(&messages, None).await? {
+            LLMResponse::Text(summary) => Ok(summary),
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    // No streaming - uses default fallback (single chunk)
 }

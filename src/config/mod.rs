@@ -50,6 +50,9 @@ pub struct ProvidersConfig {
 
     #[serde(default)]
     pub ollama: Option<OllamaConfig>,
+
+    #[serde(default)]
+    pub claude_cli: Option<ClaudeCliConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +77,15 @@ pub struct OllamaConfig {
     pub endpoint: String,
 
     #[serde(default = "default_ollama_model")]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeCliConfig {
+    #[serde(default = "default_claude_cli_command")]
+    pub command: String,
+
+    #[serde(default = "default_claude_cli_model")]
     pub model: String,
 }
 
@@ -136,7 +148,7 @@ pub struct LoggingConfig {
 
 // Default value functions
 fn default_model() -> String {
-    "gpt-4".to_string()
+    "claude-cli/opus".to_string()
 }
 fn default_context_window() -> usize {
     128000
@@ -155,6 +167,12 @@ fn default_ollama_endpoint() -> String {
 }
 fn default_ollama_model() -> String {
     "llama3".to_string()
+}
+fn default_claude_cli_command() -> String {
+    "claude".to_string()
+}
+fn default_claude_cli_model() -> String {
+    "opus".to_string()
 }
 fn default_true() -> bool {
     true
@@ -216,6 +234,7 @@ impl Default for ProvidersConfig {
             openai: None,
             anthropic: None,
             ollama: None,
+            claude_cli: None,
         }
     }
 }
