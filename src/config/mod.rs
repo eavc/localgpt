@@ -151,7 +151,8 @@ pub struct LoggingConfig {
 // Default value functions
 fn default_model() -> String {
     // Default to Anthropic API (requires ANTHROPIC_API_KEY)
-    "claude-sonnet-4-5-20250514".to_string()
+    // Use shorthand "anthropic/sonnet" which maps to latest Sonnet model
+    "anthropic/sonnet".to_string()
 }
 fn default_context_window() -> usize {
     128000

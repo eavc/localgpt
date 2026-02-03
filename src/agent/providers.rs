@@ -113,13 +113,34 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
         )?));
     }
 
+    // Anthropic shorthand: "anthropic/opus", "anthropic/sonnet", "anthropic/haiku"
+    if model.starts_with("anthropic/") {
+        let model_name = model.strip_prefix("anthropic/").unwrap_or("sonnet");
+        let full_model = normalize_anthropic_model(model_name);
+        let anthropic_config = config
+            .providers
+            .anthropic
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "Anthropic provider not configured. Set ANTHROPIC_API_KEY or add [providers.anthropic] to config.toml"
+            ))?;
+
+        return Ok(Box::new(AnthropicProvider::new(
+            &anthropic_config.api_key,
+            &anthropic_config.base_url,
+            &full_model,
+        )?));
+    }
+
     // Determine provider from model name
     if model.starts_with("gpt-") || model.starts_with("o1") {
         let openai_config = config
             .providers
             .openai
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenAI provider not configured"))?;
+            .ok_or_else(|| anyhow::anyhow!(
+                "OpenAI provider not configured. Set OPENAI_API_KEY or add [providers.openai] to config.toml"
+            ))?;
 
         Ok(Box::new(OpenAIProvider::new(
             &openai_config.api_key,
@@ -127,11 +148,14 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
             model,
         )?))
     } else if model.starts_with("claude-") {
+        // Full Anthropic model name (e.g., "claude-sonnet-4-5-20250514")
         let anthropic_config = config
             .providers
             .anthropic
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Anthropic provider not configured"))?;
+            .ok_or_else(|| anyhow::anyhow!(
+                "Anthropic provider not configured. Set ANTHROPIC_API_KEY or add [providers.anthropic] to config.toml"
+            ))?;
 
         Ok(Box::new(AnthropicProvider::new(
             &anthropic_config.api_key,
@@ -151,7 +175,27 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
             workspace,
         )?))
     } else {
-        anyhow::bail!("Unknown model or provider not configured: {}", model)
+        anyhow::bail!(
+            "Unknown model '{}'. Use one of:\n  \
+            - anthropic/opus, anthropic/sonnet, anthropic/haiku\n  \
+            - claude-sonnet-4-5-20250514, claude-3-opus-20240229\n  \
+            - claude-cli/opus, claude-cli/sonnet\n  \
+            - gpt-4o, gpt-4o-mini\n  \
+            - Or configure [providers.ollama] for local models",
+            model
+        )
+    }
+}
+
+/// Map shorthand Anthropic model names to full model IDs
+fn normalize_anthropic_model(shorthand: &str) -> String {
+    match shorthand.to_lowercase().as_str() {
+        "opus" | "opus-4" => "claude-sonnet-4-5-20250514".to_string(), // Note: Opus 4 not released yet, use Sonnet
+        "sonnet" | "sonnet-4" => "claude-sonnet-4-5-20250514".to_string(),
+        "haiku" | "haiku-3.5" => "claude-3-5-haiku-20241022".to_string(),
+        "sonnet-3.5" => "claude-3-5-sonnet-20241022".to_string(),
+        "opus-3" => "claude-3-opus-20240229".to_string(),
+        other => other.to_string(), // Pass through full model names
     }
 }
 
@@ -501,6 +545,111 @@ impl LLMProvider for AnthropicProvider {
             LLMResponse::Text(summary) => Ok(summary),
             _ => anyhow::bail!("Unexpected response type"),
         }
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: Option<&[ToolSchema]>,
+    ) -> Result<StreamResult> {
+        let (system_prompt, formatted_messages) = self.format_messages(messages);
+
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "messages": formatted_messages,
+            "stream": true
+        });
+
+        if let Some(system) = system_prompt {
+            body["system"] = json!(system);
+        }
+
+        debug!(
+            "Anthropic streaming request: {}",
+            serde_json::to_string_pretty(&body)?
+        );
+
+        let response = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        // Check for error status
+        if !response.status().is_success() {
+            let error_body = response.text().await?;
+            anyhow::bail!("Anthropic API error: {}", error_body);
+        }
+
+        // Anthropic streams Server-Sent Events (SSE)
+        let stream = async_stream::stream! {
+            let mut byte_stream = response.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk) = byte_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                        // Process complete SSE events (lines starting with "data: ")
+                        while let Some(pos) = buffer.find("\n\n") {
+                            let event = buffer[..pos].to_string();
+                            buffer = buffer[pos + 2..].to_string();
+
+                            // Parse SSE event
+                            for line in event.lines() {
+                                if let Some(data) = line.strip_prefix("data: ") {
+                                    if data == "[DONE]" {
+                                        yield Ok(StreamChunk {
+                                            delta: String::new(),
+                                            done: true,
+                                        });
+                                        continue;
+                                    }
+
+                                    if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                        // Handle content_block_delta events
+                                        if json["type"] == "content_block_delta" {
+                                            if let Some(delta) = json["delta"]["text"].as_str() {
+                                                yield Ok(StreamChunk {
+                                                    delta: delta.to_string(),
+                                                    done: false,
+                                                });
+                                            }
+                                        }
+                                        // Handle message_stop event
+                                        else if json["type"] == "message_stop" {
+                                            yield Ok(StreamChunk {
+                                                delta: String::new(),
+                                                done: true,
+                                            });
+                                        }
+                                        // Handle errors
+                                        else if json["type"] == "error" {
+                                            let error_msg = json["error"]["message"]
+                                                .as_str()
+                                                .unwrap_or("Unknown error");
+                                            yield Err(anyhow::anyhow!("Anthropic error: {}", error_msg));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(anyhow::anyhow!("Stream error: {}", e));
+                        break;
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 }
 

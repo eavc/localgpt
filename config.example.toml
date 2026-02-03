@@ -3,12 +3,22 @@
 
 [agent]
 # Default model to use for chat
-# Options:
-#   - "claude-sonnet-4-5-20250514" (Anthropic API, default)
-#   - "claude-3-opus-20240229" (Anthropic API)
-#   - "claude-cli/opus", "claude-cli/sonnet", "claude-cli/haiku" (Claude CLI)
-#   - "gpt-4", "gpt-4o", "gpt-4o-mini" (OpenAI API)
-default_model = "claude-sonnet-4-5-20250514"
+#
+# Anthropic API (recommended, requires ANTHROPIC_API_KEY):
+#   - "anthropic/sonnet" or "anthropic/opus" or "anthropic/haiku" (shorthand)
+#   - "claude-sonnet-4-5-20250514" (full model name)
+#   - "claude-3-opus-20240229"
+#
+# Claude CLI (local, no API key needed):
+#   - "claude-cli/opus", "claude-cli/sonnet", "claude-cli/haiku"
+#
+# OpenAI API (requires OPENAI_API_KEY):
+#   - "gpt-4o", "gpt-4o-mini", "gpt-4"
+#
+# Ollama (local):
+#   - "llama3", "mistral", etc. (requires [providers.ollama] config)
+#
+default_model = "anthropic/sonnet"
 
 # Context window size (in tokens)
 context_window = 128000
