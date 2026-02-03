@@ -35,6 +35,8 @@ LocalGPT is a local-only AI assistant with persistent markdown-based memory and 
   - `providers.rs` - Trait `LLMProvider` with implementations for OpenAI, Anthropic, Ollama, and Claude CLI. Model prefix determines provider (`claude-cli/*` → Claude CLI, `gpt-*` → OpenAI, `claude-*` → Anthropic API, else Ollama)
   - `session.rs` - Conversation state with automatic compaction when approaching context window limits
   - `session_store.rs` - Session metadata store (`sessions.json`) with CLI session ID persistence
+  - `system_prompt.rs` - Builds system prompt with identity, safety, workspace info, tools, skills, and special tokens
+  - `skills.rs` - Loads SKILL.md files from workspace/skills/ for specialized task handling
   - `tools.rs` - Agent tools: `bash`, `read_file`, `write_file`, `edit_file`, `memory_search`, `memory_append`, `web_fetch`
 
 - **memory/** - Markdown-based knowledge store
@@ -52,6 +54,7 @@ LocalGPT is a local-only AI assistant with persistent markdown-based memory and 
 - **config/** - TOML configuration at `~/.localgpt/config.toml`
   - Supports `${ENV_VAR}` expansion in API keys
   - `workspace_path()` returns expanded memory workspace path
+  - `migrate.rs` - Auto-migrates from OpenClaw's `~/.openclaw/config.json5` if LocalGPT config doesn't exist
 
 - **cli/** - Clap-based subcommands: `chat`, `ask`, `daemon`, `memory`, `config`
 
@@ -72,6 +75,34 @@ Key settings:
 - `heartbeat.interval` - Duration string (e.g., "30m", "1h")
 - `heartbeat.active_hours` - Optional `{start, end}` in "HH:MM" format
 - `server.port` - HTTP server port (default: 18790)
+
+## Skills System
+
+Skills are SKILL.md files in `workspace/skills/<skill-name>/SKILL.md` that provide specialized instructions.
+
+```
+~/.localgpt/workspace/
+└── skills/
+    ├── code-review/
+    │   └── SKILL.md
+    └── commit-message/
+        └── SKILL.md
+```
+
+When a skill applies, the agent reads the SKILL.md and follows its instructions. The system prompt includes an `<available_skills>` list with skill names, descriptions, and paths.
+
+## CLI Commands (Interactive Chat)
+
+In the `chat` command, these slash commands are available:
+
+- `/help` - Show available commands
+- `/quit`, `/exit`, `/q` - Exit chat
+- `/new` - Start fresh session (reloads system prompt and memory context)
+- `/compact` - Compact session history (summarize and truncate)
+- `/clear` - Clear session history (keeps current context)
+- `/memory <query>` - Search memory files
+- `/save` - Save current session to disk
+- `/status` - Show session info (ID, messages, tokens, compactions)
 
 ## OpenClaw Compatibility
 
@@ -120,6 +151,13 @@ cp -r ~/.openclaw/workspace ~/.localgpt/workspace
 - No multi-channel routing (LocalGPT is local-only)
 - No bindings/agents.list (LocalGPT uses single "main" agent)
 - No subagent spawning (yet)
+
+**Auto-config migration:**
+If `~/.localgpt/config.toml` doesn't exist but `~/.openclaw/config.json5` does, LocalGPT will auto-migrate:
+- `agents.defaults.workspace` → `memory.workspace`
+- `agents.defaults.model` → `agent.default_model`
+- `models.openai.apiKey` → `providers.openai.api_key`
+- `models.anthropic.apiKey` → `providers.anthropic.api_key`
 
 ### sessions.json Format
 
