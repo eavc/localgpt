@@ -54,6 +54,7 @@ pub struct AgentConfig {
 
 pub struct Agent {
     config: AgentConfig,
+    app_config: Config,
     provider: Box<dyn LLMProvider>,
     session: Session,
     memory: MemoryManager,
@@ -73,6 +74,7 @@ impl Agent {
 
         Ok(Self {
             config,
+            app_config: app_config.clone(),
             provider,
             session: Session::new(),
             memory,
@@ -83,6 +85,15 @@ impl Agent {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Switch to a different model
+    pub fn set_model(&mut self, model: &str) -> Result<()> {
+        let provider = providers::create_provider(model, &self.app_config)?;
+        self.config.model = model.to_string();
+        self.provider = provider;
+        info!("Switched to model: {}", model);
+        Ok(())
     }
 
     pub fn memory_chunk_count(&self) -> usize {

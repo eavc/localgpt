@@ -7,14 +7,14 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::{
         sse::{Event, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use futures::{SinkExt, StreamExt};
@@ -85,6 +85,8 @@ impl Server {
             .route("/health", get(health_check))
             .route("/api/sessions", post(create_session))
             .route("/api/sessions", get(list_sessions))
+            .route("/api/sessions/{session_id}", delete(delete_session))
+            .route("/api/sessions/{session_id}", get(get_session_status))
             .route("/api/chat", post(chat))
             .route("/api/chat/stream", post(chat_stream))
             .route("/api/ws", get(websocket_handler))
@@ -275,6 +277,57 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<ListSessionsR
     Json(ListSessionsResponse {
         sessions: session_list,
     })
+}
+
+// Delete a session
+async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let mut sessions = state.sessions.lock().await;
+
+    if sessions.remove(&session_id).is_some() {
+        info!("Deleted session: {}", session_id);
+        Json(json!({"deleted": true, "session_id": session_id})).into_response()
+    } else {
+        AppError(StatusCode::NOT_FOUND, "Session not found".to_string()).into_response()
+    }
+}
+
+// Get session status
+#[derive(Serialize)]
+struct SessionStatusResponse {
+    session_id: String,
+    model: String,
+    message_count: usize,
+    token_count: usize,
+    idle_seconds: u64,
+    api_input_tokens: u64,
+    api_output_tokens: u64,
+}
+
+async fn get_session_status(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let sessions = state.sessions.lock().await;
+
+    match sessions.get(&session_id) {
+        Some(entry) => {
+            let status = entry.agent.session_status();
+            Json(SessionStatusResponse {
+                session_id,
+                model: entry.agent.model().to_string(),
+                message_count: status.message_count,
+                token_count: status.token_count,
+                idle_seconds: entry.last_accessed.elapsed().as_secs(),
+                api_input_tokens: status.api_input_tokens,
+                api_output_tokens: status.api_output_tokens,
+            })
+            .into_response()
+        }
+        None => AppError(StatusCode::NOT_FOUND, "Session not found".to_string()).into_response(),
+    }
 }
 
 // Chat endpoint

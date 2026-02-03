@@ -319,6 +319,7 @@ async fn handle_command(input: &str, agent: &mut Agent, agent_id: &str) -> Comma
             println!("  /new              - Start a fresh session (reloads memory context)");
             println!("  /sessions         - List available sessions");
             println!("  /resume <id>      - Resume a specific session");
+            println!("  /model [name]     - Show or switch model (e.g., /model gpt-4o)");
             println!("  /compact          - Compact session history");
             println!("  /clear            - Clear session history (keeps context)");
             println!("  /memory <query>   - Search memory");
@@ -395,6 +396,21 @@ async fn handle_command(input: &str, agent: &mut Agent, agent_id: &str) -> Comma
                     }
                 }
                 Err(e) => CommandResult::Error(format!("Failed to list sessions: {}", e)),
+            }
+        }
+
+        "/model" => {
+            if parts.len() < 2 {
+                println!("\nCurrent model: {}\n", agent.model());
+                return CommandResult::Continue;
+            }
+            let model = parts[1];
+            match agent.set_model(model) {
+                Ok(()) => {
+                    println!("\nSwitched to model: {}\n", model);
+                    CommandResult::Continue
+                }
+                Err(e) => CommandResult::Error(format!("Failed to switch model: {}", e)),
             }
         }
 
