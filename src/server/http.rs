@@ -4,7 +4,10 @@
 
 use anyhow::Result;
 use axum::{
-    extract::{Query, State},
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Query, State,
+    },
     http::StatusCode,
     response::{
         sse::{Event, Sse},
@@ -13,6 +16,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
@@ -20,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::agent::{Agent, AgentConfig, StreamEvent};
 use crate::config::Config;
@@ -67,6 +71,7 @@ impl Server {
             .route("/health", get(health_check))
             .route("/api/chat", post(chat))
             .route("/api/chat/stream", post(chat_stream))
+            .route("/api/ws", get(websocket_handler))
             .route("/api/memory/search", get(memory_search))
             .route("/api/memory/stats", get(memory_stats))
             .route("/api/status", get(status))
@@ -292,4 +297,139 @@ fn memory_stats_inner(
         total_chunks: stats.total_chunks,
         index_size_kb: stats.index_size_kb,
     })
+}
+
+// WebSocket handler
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_websocket(socket, state))
+}
+
+/// WebSocket message types
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum WsIncoming {
+    /// Chat message
+    #[serde(rename = "chat")]
+    Chat { message: String },
+    /// Ping for keepalive
+    #[serde(rename = "ping")]
+    Ping,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+#[allow(dead_code)] // ToolStart/ToolEnd reserved for streaming with tools
+enum WsOutgoing {
+    /// Connection established
+    #[serde(rename = "connected")]
+    Connected { session_id: String },
+    /// Text content chunk
+    #[serde(rename = "content")]
+    Content { delta: String },
+    /// Tool call started
+    #[serde(rename = "tool_start")]
+    ToolStart { name: String, id: String },
+    /// Tool call completed
+    #[serde(rename = "tool_end")]
+    ToolEnd { name: String, id: String, output: String },
+    /// Message complete
+    #[serde(rename = "done")]
+    Done,
+    /// Pong response
+    #[serde(rename = "pong")]
+    Pong,
+    /// Error
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Send connected message
+    let session_id = {
+        let agent = state.agent.lock().await;
+        agent.session_status().id
+    };
+
+    let connected = WsOutgoing::Connected { session_id };
+    if let Ok(json) = serde_json::to_string(&connected) {
+        let _ = sender.send(WsMessage::Text(json.into())).await;
+    }
+
+    debug!("WebSocket client connected");
+
+    // Process incoming messages
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(WsMessage::Text(text)) => {
+                // Parse incoming message
+                match serde_json::from_str::<WsIncoming>(&text) {
+                    Ok(WsIncoming::Chat { message }) => {
+                        debug!("WebSocket chat: {}", message);
+
+                        // Process chat (with tool support)
+                        let mut agent = state.agent.lock().await;
+
+                        match agent.chat(&message).await {
+                            Ok(response) => {
+                                // Send response as content
+                                let content = WsOutgoing::Content {
+                                    delta: response,
+                                };
+                                if let Ok(json) = serde_json::to_string(&content) {
+                                    let _ = sender.send(WsMessage::Text(json.into())).await;
+                                }
+
+                                // Send done
+                                let done = WsOutgoing::Done;
+                                if let Ok(json) = serde_json::to_string(&done) {
+                                    let _ = sender.send(WsMessage::Text(json.into())).await;
+                                }
+                            }
+                            Err(e) => {
+                                let error = WsOutgoing::Error {
+                                    message: e.to_string(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&error) {
+                                    let _ = sender.send(WsMessage::Text(json.into())).await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(WsIncoming::Ping) => {
+                        let pong = WsOutgoing::Pong;
+                        if let Ok(json) = serde_json::to_string(&pong) {
+                            let _ = sender.send(WsMessage::Text(json.into())).await;
+                        }
+                    }
+                    Err(e) => {
+                        let error = WsOutgoing::Error {
+                            message: format!("Invalid message format: {}", e),
+                        };
+                        if let Ok(json) = serde_json::to_string(&error) {
+                            let _ = sender.send(WsMessage::Text(json.into())).await;
+                        }
+                    }
+                }
+            }
+            Ok(WsMessage::Ping(data)) => {
+                let _ = sender.send(WsMessage::Pong(data)).await;
+            }
+            Ok(WsMessage::Close(_)) => {
+                debug!("WebSocket client disconnected");
+                break;
+            }
+            Err(e) => {
+                debug!("WebSocket error: {}", e);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    debug!("WebSocket connection closed");
 }
