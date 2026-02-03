@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, info};
+use uuid::Uuid;
 
 use super::embeddings::{cosine_similarity, deserialize_embedding, serialize_embedding};
 use super::search::MemoryChunk;
@@ -35,52 +36,70 @@ impl MemoryIndex {
 
         let conn = Connection::open(db_path)?;
 
-        // Initialize schema
+        // Check if we need to migrate from old schema
+        let needs_migration = Self::needs_schema_migration(&conn)?;
+        if needs_migration {
+            info!("Migrating database schema to OpenClaw-compatible format");
+            Self::migrate_to_openclaw_schema(&conn)?;
+        }
+
+        // Initialize OpenClaw-compatible schema
         conn.execute_batch(
             r#"
-            -- File tracking
+            -- Metadata key/value store
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            -- File tracking (OpenClaw-compatible)
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
+                source TEXT NOT NULL DEFAULT 'memory',
                 hash TEXT NOT NULL,
                 mtime INTEGER NOT NULL,
                 size INTEGER NOT NULL
             );
 
-            -- Chunked content (embedding columns added via migration)
+            -- Chunked content (OpenClaw-compatible)
             CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY,
-                file_path TEXT NOT NULL,
-                line_start INTEGER NOT NULL,
-                line_end INTEGER NOT NULL,
-                content TEXT NOT NULL,
-                FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'memory',
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL,
+                embedding TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
             );
 
-            -- Full-text search index
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                content,
-                content='chunks',
-                content_rowid='id'
+            -- Embedding cache (OpenClaw-compatible)
+            CREATE TABLE IF NOT EXISTS embedding_cache (
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                provider_key TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                embedding TEXT NOT NULL,
+                dims INTEGER,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (provider, model, provider_key, hash)
             );
 
-            -- Triggers to keep FTS in sync
-            CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-                INSERT INTO chunks_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
-                INSERT INTO chunks_fts(rowid, content) VALUES (new.id, new.content);
-            END;
+            -- Indexes
+            CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
+            CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
+            CREATE INDEX IF NOT EXISTS idx_embedding_cache_updated_at ON embedding_cache(updated_at);
             "#,
         )?;
 
-        // Migration: add embedding columns if they don't exist
-        Self::migrate_add_embedding_columns(&conn)?;
+        // Create FTS5 table (OpenClaw-compatible with UNINDEXED columns)
+        Self::ensure_fts_table(&conn)?;
+
+        // Ensure source column exists on older tables
+        Self::ensure_column(&conn, "files", "source", "TEXT NOT NULL DEFAULT 'memory'")?;
+        Self::ensure_column(&conn, "chunks", "source", "TEXT NOT NULL DEFAULT 'memory'")?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -98,7 +117,7 @@ impl MemoryIndex {
     /// Index a file, returning true if it was updated
     pub fn index_file(&self, path: &Path, force: bool) -> Result<bool> {
         let content = fs::read_to_string(path)?;
-        let hash = hash_content(&content);
+        let file_hash = hash_content(&content);
         let metadata = fs::metadata(path)?;
         let mtime = metadata
             .modified()?
@@ -127,7 +146,7 @@ impl MemoryIndex {
                 )
                 .ok();
 
-            if existing.as_deref() == Some(&hash) {
+            if existing.as_deref() == Some(&file_hash) {
                 debug!("File unchanged, skipping: {}", relative_path);
                 return Ok(false);
             }
@@ -135,29 +154,76 @@ impl MemoryIndex {
 
         debug!("Indexing file: {}", relative_path);
 
-        // Update file record
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        // Update file record (OpenClaw-compatible columns)
         conn.execute(
-            "INSERT OR REPLACE INTO files (path, hash, mtime, size) VALUES (?1, ?2, ?3, ?4)",
-            params![&relative_path, &hash, mtime, size],
+            "INSERT OR REPLACE INTO files (path, source, hash, mtime, size) VALUES (?1, 'memory', ?2, ?3, ?4)",
+            params![&relative_path, &file_hash, mtime, size],
         )?;
 
-        // Delete existing chunks
-        conn.execute(
-            "DELETE FROM chunks WHERE file_path = ?1",
-            params![&relative_path],
-        )?;
+        // Delete existing chunks and their FTS entries
+        Self::delete_chunks_for_path(&conn, &relative_path)?;
 
-        // Create new chunks
+        // Create new chunks (OpenClaw-compatible)
         let chunks = chunk_text(&content, 400, 80);
 
-        for (_i, chunk) in chunks.iter().enumerate() {
+        for chunk in chunks.iter() {
+            let chunk_id = Uuid::new_v4().to_string();
+            let chunk_hash = hash_content(&chunk.content);
+
             conn.execute(
-                "INSERT INTO chunks (file_path, line_start, line_end, content) VALUES (?1, ?2, ?3, ?4)",
-                params![&relative_path, chunk.line_start, chunk.line_end, &chunk.content],
+                r#"INSERT INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
+                   VALUES (?1, ?2, 'memory', ?3, ?4, ?5, '', ?6, '', ?7)"#,
+                params![&chunk_id, &relative_path, chunk.line_start, chunk.line_end, &chunk_hash, &chunk.content, now],
             )?;
+
+            // Insert into FTS
+            Self::insert_fts(&conn, &chunk_id, &relative_path, "memory", "", chunk.line_start, chunk.line_end, &chunk.content)?;
         }
 
         Ok(true)
+    }
+
+    /// Delete chunks for a path and their FTS entries
+    fn delete_chunks_for_path(conn: &Connection, path: &str) -> Result<()> {
+        // Delete from FTS first (get chunk IDs)
+        let mut stmt = conn.prepare("SELECT id FROM chunks WHERE path = ?1")?;
+        let chunk_ids: Vec<String> = stmt
+            .query_map(params![path], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for chunk_id in chunk_ids {
+            let _ = conn.execute(
+                "DELETE FROM chunks_fts WHERE id = ?1",
+                params![&chunk_id],
+            );
+        }
+
+        // Delete chunks
+        conn.execute("DELETE FROM chunks WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// Insert into FTS table
+    fn insert_fts(
+        conn: &Connection,
+        id: &str,
+        path: &str,
+        source: &str,
+        model: &str,
+        start_line: i32,
+        end_line: i32,
+        text: &str,
+    ) -> Result<()> {
+        let _ = conn.execute(
+            "INSERT INTO chunks_fts (text, id, path, source, model, start_line, end_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![text, id, path, source, model, start_line, end_line],
+        );
+        Ok(())
     }
 
     /// Search using FTS5
@@ -170,11 +236,11 @@ impl MemoryIndex {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
+        // OpenClaw-compatible: use 'path', 'start_line', 'end_line', 'text' columns
         let mut stmt = conn.prepare(
             r#"
-            SELECT c.file_path, c.line_start, c.line_end, c.content, bm25(chunks_fts) as score
+            SELECT fts.path, fts.start_line, fts.end_line, fts.text, bm25(chunks_fts) as score
             FROM chunks_fts fts
-            JOIN chunks c ON fts.rowid = c.id
             WHERE chunks_fts MATCH ?1
             ORDER BY score
             LIMIT ?2
@@ -222,7 +288,7 @@ impl MemoryIndex {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE file_path = ?1",
+            "SELECT COUNT(*) FROM chunks WHERE path = ?1",
             params![&relative_path],
             |row| row.get(0),
         )?;
@@ -243,41 +309,218 @@ impl MemoryIndex {
         &self.db_path
     }
 
-    /// Migration: add embedding columns if they don't exist
-    fn migrate_add_embedding_columns(conn: &Connection) -> Result<()> {
-        // Check if embedding column exists
-        let has_embedding: bool = conn
-            .prepare("SELECT embedding FROM chunks LIMIT 1")
-            .is_ok();
+    /// Check if we need to migrate from old LocalGPT schema to OpenClaw schema
+    fn needs_schema_migration(conn: &Connection) -> Result<bool> {
+        // Check for old schema indicators:
+        // 1. chunks table has 'file_path' column instead of 'path'
+        // 2. chunks table has 'content' column instead of 'text'
+        // 3. chunks.id is INTEGER instead of TEXT
+        let result: rusqlite::Result<String> =
+            conn.query_row("PRAGMA table_info(chunks)", [], |row| row.get(1));
 
-        if !has_embedding {
-            debug!("Migrating: adding embedding columns to chunks");
-            conn.execute("ALTER TABLE chunks ADD COLUMN embedding TEXT", [])?;
-            conn.execute("ALTER TABLE chunks ADD COLUMN embedding_model TEXT", [])?;
+        if result.is_err() {
+            // chunks table doesn't exist yet, no migration needed
+            return Ok(false);
         }
 
-        // Create index (safe to run even if exists due to IF NOT EXISTS)
+        // Check column names
+        let has_file_path: bool = conn
+            .prepare("SELECT file_path FROM chunks LIMIT 0")
+            .is_ok();
+        let has_content: bool = conn.prepare("SELECT content FROM chunks LIMIT 0").is_ok();
+
+        // Old schema has file_path and content columns
+        Ok(has_file_path || has_content)
+    }
+
+    /// Migrate from old LocalGPT schema to OpenClaw-compatible schema
+    fn migrate_to_openclaw_schema(conn: &Connection) -> Result<()> {
+        // Start transaction
+        conn.execute("BEGIN TRANSACTION", [])?;
+
+        // 1. Rename old tables
+        let _ = conn.execute("ALTER TABLE chunks RENAME TO chunks_old", []);
+        let _ = conn.execute("ALTER TABLE files RENAME TO files_old", []);
+
+        // 2. Drop old FTS and triggers
+        let _ = conn.execute("DROP TABLE IF EXISTS chunks_fts", []);
+        let _ = conn.execute("DROP TRIGGER IF EXISTS chunks_ai", []);
+        let _ = conn.execute("DROP TRIGGER IF EXISTS chunks_ad", []);
+        let _ = conn.execute("DROP TRIGGER IF EXISTS chunks_au", []);
+
+        // 3. Create new tables with OpenClaw schema
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks(embedding_model)",
+            r#"
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                source TEXT NOT NULL DEFAULT 'memory',
+                hash TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                size INTEGER NOT NULL
+            )
+            "#,
             [],
         )?;
+
+        conn.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS chunks (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'memory',
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL,
+                embedding TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )
+            "#,
+            [],
+        )?;
+
+        // 4. Migrate data from old tables
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        // Migrate files
+        let _ = conn.execute(
+            r#"
+            INSERT INTO files (path, source, hash, mtime, size)
+            SELECT path, 'memory', hash, mtime, size FROM files_old
+            "#,
+            [],
+        );
+
+        // Migrate chunks - generate new TEXT UUIDs for each row
+        // Check if old schema has embedding columns
+        let has_embedding_cols = conn
+            .prepare("SELECT embedding FROM chunks_old LIMIT 0")
+            .is_ok();
+
+        // Read old data and insert with new UUIDs
+        if has_embedding_cols {
+            // Old schema has embedding columns
+            let mut stmt = conn.prepare(
+                "SELECT file_path, line_start, line_end, content, embedding, embedding_model FROM chunks_old",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (file_path, line_start, line_end, content, embedding, model) = row?;
+                let new_id = Uuid::new_v4().to_string();
+                let hash = hash_content(&content);
+                let model = model.unwrap_or_default();
+                let embedding = embedding.unwrap_or_default();
+
+                conn.execute(
+                    r#"
+                    INSERT INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
+                    VALUES (?1, ?2, 'memory', ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    "#,
+                    params![&new_id, &file_path, line_start, line_end, &hash, &model, &content, &embedding, now],
+                )?;
+            }
+        } else {
+            // Old schema without embedding columns
+            let mut stmt = conn.prepare(
+                "SELECT file_path, line_start, line_end, content FROM chunks_old",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (file_path, line_start, line_end, content) = row?;
+                let new_id = Uuid::new_v4().to_string();
+                let hash = hash_content(&content);
+
+                conn.execute(
+                    r#"
+                    INSERT INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
+                    VALUES (?1, ?2, 'memory', ?3, ?4, ?5, '', ?6, '', ?7)
+                    "#,
+                    params![&new_id, &file_path, line_start, line_end, &hash, &content, now],
+                )?;
+            }
+        }
+
+        // 5. Drop old tables
+        let _ = conn.execute("DROP TABLE IF EXISTS chunks_old", []);
+        let _ = conn.execute("DROP TABLE IF EXISTS files_old", []);
+
+        conn.execute("COMMIT", [])?;
+        info!("Schema migration completed successfully");
+        Ok(())
+    }
+
+    /// Create FTS5 table with OpenClaw-compatible structure
+    fn ensure_fts_table(conn: &Connection) -> Result<()> {
+        // OpenClaw uses UNINDEXED columns for metadata
+        let result = conn.execute(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text,
+                id UNINDEXED,
+                path UNINDEXED,
+                source UNINDEXED,
+                model UNINDEXED,
+                start_line UNINDEXED,
+                end_line UNINDEXED
+            )
+            "#,
+            [],
+        );
+
+        match result {
+            Ok(_) => debug!("FTS5 table created/verified"),
+            Err(e) => debug!("FTS5 table creation skipped: {}", e),
+        }
 
         Ok(())
     }
 
-    /// Get chunks that need embeddings
-    pub fn chunks_without_embeddings(&self, limit: usize) -> Result<Vec<(i64, String)>> {
+    /// Ensure a column exists on a table (for migrations)
+    fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+        let sql = format!("SELECT {} FROM {} LIMIT 0", column, table);
+        if conn.prepare(&sql).is_err() {
+            let alter = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition);
+            conn.execute(&alter, [])?;
+            debug!("Added column {} to table {}", column, table);
+        }
+        Ok(())
+    }
+
+    /// Get chunks that need embeddings (OpenClaw-compatible: id is TEXT, text column)
+    pub fn chunks_without_embeddings(&self, limit: usize) -> Result<Vec<(String, String)>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, content FROM chunks WHERE embedding IS NULL LIMIT ?1",
+            "SELECT id, text FROM chunks WHERE embedding = '' OR embedding IS NULL LIMIT ?1",
         )?;
 
         let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
 
         let mut results = Vec::new();
@@ -288,24 +531,27 @@ impl MemoryIndex {
         Ok(results)
     }
 
-    /// Store embedding for a chunk
-    pub fn store_embedding(&self, chunk_id: i64, embedding: &[f32], model: &str) -> Result<()> {
+    /// Store embedding for a chunk (OpenClaw-compatible: id is TEXT, model column)
+    pub fn store_embedding(&self, chunk_id: &str, embedding: &[f32], model: &str) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
         let embedding_json = serialize_embedding(embedding);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
 
         conn.execute(
-            "UPDATE chunks SET embedding = ?1, embedding_model = ?2 WHERE id = ?3",
-            params![&embedding_json, model, chunk_id],
+            "UPDATE chunks SET embedding = ?1, model = ?2, updated_at = ?3 WHERE id = ?4",
+            params![&embedding_json, model, now, chunk_id],
         )?;
 
         Ok(())
     }
 
-    /// Vector search using embeddings
+    /// Vector search using embeddings (OpenClaw-compatible columns)
     pub fn search_vector(
         &self,
         query_embedding: &[f32],
@@ -319,14 +565,14 @@ impl MemoryIndex {
 
         // Get all chunks with embeddings for this model
         let mut stmt = conn.prepare(
-            "SELECT id, file_path, line_start, line_end, content, embedding
+            "SELECT id, path, start_line, end_line, text, embedding
              FROM chunks
-             WHERE embedding IS NOT NULL AND embedding_model = ?1",
+             WHERE embedding != '' AND embedding IS NOT NULL AND model = ?1",
         )?;
 
         let rows = stmt.query_map(params![model], |row| {
             Ok((
-                row.get::<_, i64>(0)?,
+                row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i32>(2)?,
                 row.get::<_, i32>(3)?,
@@ -339,7 +585,7 @@ impl MemoryIndex {
         let mut scored: Vec<(f32, MemoryChunk)> = Vec::new();
 
         for row in rows {
-            let (_, file_path, line_start, line_end, content, embedding_json) = row?;
+            let (_, path, start_line, end_line, text, embedding_json) = row?;
             let embedding = deserialize_embedding(&embedding_json);
 
             if embedding.len() == query_embedding.len() {
@@ -347,10 +593,10 @@ impl MemoryIndex {
                 scored.push((
                     similarity,
                     MemoryChunk {
-                        file: file_path,
-                        line_start,
-                        line_end,
-                        content,
+                        file: path,
+                        line_start: start_line,
+                        line_end: end_line,
+                        content: text,
                         score: similarity as f64,
                     },
                 ));
@@ -424,7 +670,7 @@ impl MemoryIndex {
         Ok(results.into_iter().take(limit).map(|(_, chunk)| chunk).collect())
     }
 
-    /// Count chunks with embeddings
+    /// Count chunks with embeddings (OpenClaw-compatible: model column)
     pub fn embedded_chunk_count(&self, model: &str) -> Result<usize> {
         let conn = self
             .conn
@@ -432,7 +678,7 @@ impl MemoryIndex {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL AND embedding_model = ?1",
+            "SELECT COUNT(*) FROM chunks WHERE embedding != '' AND embedding IS NOT NULL AND model = ?1",
             params![model],
             |row| row.get(0),
         )?;
