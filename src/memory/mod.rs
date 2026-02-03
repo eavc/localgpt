@@ -1,10 +1,12 @@
 mod index;
 mod search;
 mod watcher;
+mod workspace;
 
 pub use index::{MemoryIndex, ReindexStats};
 pub use search::MemoryChunk;
 pub use watcher::MemoryWatcher;
+pub use workspace::{init_state_dir, init_workspace};
 
 use anyhow::Result;
 use chrono::Local;
@@ -50,9 +52,8 @@ impl MemoryManager {
         let workspace = shellexpand::tilde(&config.workspace).to_string();
         let workspace = PathBuf::from(workspace);
 
-        // Ensure workspace directories exist
-        fs::create_dir_all(&workspace)?;
-        fs::create_dir_all(workspace.join("memory"))?;
+        // Initialize workspace with templates if needed
+        init_workspace(&workspace)?;
 
         let index = MemoryIndex::new(&workspace)?;
 

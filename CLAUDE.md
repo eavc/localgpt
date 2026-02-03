@@ -42,6 +42,7 @@ LocalGPT is a local-only AI assistant with persistent markdown-based memory and 
 - **memory/** - Markdown-based knowledge store
   - `index.rs` - SQLite FTS5 index for fast search. Chunks files (~400 tokens with 80 token overlap)
   - `watcher.rs` - File system watcher for automatic reindexing
+  - `workspace.rs` - Auto-creates workspace templates on first run (MEMORY.md, HEARTBEAT.md, SOUL.md, .gitignore)
   - Files: `MEMORY.md` (curated knowledge), `HEARTBEAT.md` (pending tasks), `memory/YYYY-MM-DD.md` (daily logs)
 
 - **heartbeat/** - Autonomous task runner
@@ -174,3 +175,22 @@ If `~/.localgpt/config.toml` doesn't exist but `~/.openclaw/config.json5` does, 
   }
 }
 ```
+
+## Git Version Control
+
+LocalGPT auto-creates `.gitignore` files. Recommended version control:
+
+**Version control (workspace/):**
+- `MEMORY.md` - Your curated knowledge
+- `HEARTBEAT.md` - Pending tasks
+- `SOUL.md` - Your persona
+- `memory/*.md` - Daily logs
+- `skills/` - Custom skills
+
+**Do NOT version control:**
+- `agents/*/sessions/*.jsonl` - Conversation transcripts (large)
+- `logs/` - Debug logs
+- `*.db` - SQLite database files
+
+**Be careful with:**
+- `config.toml` - May contain API keys. Use `${ENV_VAR}` syntax instead of raw keys.
