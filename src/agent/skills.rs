@@ -607,8 +607,9 @@ pub fn get_skills_summary(skills: &[Skill]) -> String {
     lines.join("\n")
 }
 
-// Legacy function for backward compatibility
-pub fn extract_description(content: &str) -> String {
+/// Extract description from skill content (used by tests)
+#[allow(dead_code)]
+fn extract_description(content: &str) -> String {
     let (fm, body) = parse_frontmatter(content);
     fm.description
         .unwrap_or_else(|| extract_description_from_body(&body))
