@@ -25,6 +25,27 @@ cargo clippy
 cargo fmt --check
 ```
 
+## Git Workflow
+
+This project uses **git flow** with a `development` branch for integration:
+
+- **`main`** — stable, production-ready code
+- **`development`** — integration branch for completed features/fixes
+- **Feature/fix branches** — branch from `development`, merge back with `--no-ff` to preserve topology, then rebase `development` onto `main` when releasing to keep linear history
+
+```bash
+# Start work
+git checkout -b feat/my-feature development
+
+# Merge completed work (preserves branch topology)
+git checkout development
+git merge --no-ff feat/my-feature
+
+# Release to main (linear history)
+git checkout main
+git rebase development
+```
+
 ## Architecture
 
 LocalGPT is a local-only AI assistant with persistent markdown-based memory and optional autonomous operation via heartbeat. Single binary, no runtime dependencies.
