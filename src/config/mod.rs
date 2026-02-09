@@ -55,9 +55,13 @@ pub struct ToolsConfig {
     #[serde(default = "default_bash_timeout")]
     pub bash_timeout_ms: u64,
 
-    /// Maximum bytes to return from web_fetch
+    /// Maximum bytes to download from web_fetch (streaming limit, not buffer-then-truncate)
     #[serde(default = "default_web_fetch_max_bytes")]
     pub web_fetch_max_bytes: usize,
+
+    /// Request timeout for web_fetch in seconds
+    #[serde(default = "default_web_fetch_timeout_secs")]
+    pub web_fetch_timeout_secs: u64,
 
     /// Tools that require user approval before execution.
     /// Default: ["bash", "write_file", "edit_file"].
@@ -280,6 +284,9 @@ fn default_bash_timeout() -> u64 {
 fn default_web_fetch_max_bytes() -> usize {
     10000
 }
+fn default_web_fetch_timeout_secs() -> u64 {
+    30
+}
 fn default_tool_output_max_chars() -> usize {
     50000 // 50k characters max for tool output by default
 }
@@ -377,6 +384,7 @@ impl Default for ToolsConfig {
         Self {
             bash_timeout_ms: default_bash_timeout(),
             web_fetch_max_bytes: default_web_fetch_max_bytes(),
+            web_fetch_timeout_secs: default_web_fetch_timeout_secs(),
             require_approval: default_require_approval(),
             tool_output_max_chars: default_tool_output_max_chars(),
             log_injection_warnings: default_true(),
@@ -684,6 +692,12 @@ workspace = "~/.localgpt/workspace"
 # canonicalized at startup; entries that do not exist on disk are silently
 # skipped (a warning is logged).
 # allowed_paths = ["/tmp/localgpt", "~/projects"]
+
+# Maximum bytes downloaded by web_fetch (streaming limit). Default: 10000
+# web_fetch_max_bytes = 10000
+
+# Request timeout for web_fetch in seconds. Default: 30
+# web_fetch_timeout_secs = 30
 
 [server]
 enabled = true

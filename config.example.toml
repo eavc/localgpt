@@ -141,6 +141,12 @@ chunk_overlap = 80
 # skipped (a warning is logged).
 # allowed_paths = ["/tmp/localgpt", "~/projects"]
 
+# Maximum bytes downloaded by web_fetch (streaming limit). Default: 10000
+# web_fetch_max_bytes = 10000
+
+# Request timeout for web_fetch in seconds. Default: 30
+# web_fetch_timeout_secs = 30
+
 [server]
 # Enable HTTP server
 enabled = true
