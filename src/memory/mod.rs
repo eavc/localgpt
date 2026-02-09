@@ -194,6 +194,23 @@ impl MemoryManager {
         })
     }
 
+    /// Create a minimal MemoryManager for testing (uses temp directory, no embeddings).
+    #[cfg(test)]
+    pub fn new_stub() -> Self {
+        let dir = std::env::temp_dir().join(format!("localgpt-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("test.sqlite");
+        let index = MemoryIndex::new_with_db_path(&dir, &db_path).expect("create test index");
+        Self {
+            workspace: dir,
+            db_path,
+            index,
+            config: MemoryConfig::default(),
+            embedding_provider: None,
+            is_brand_new: true,
+        }
+    }
+
     /// Set embedding provider for semantic search (requires OpenAI API key)
     pub fn with_embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
         self.embedding_provider = Some(provider);

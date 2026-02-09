@@ -99,6 +99,7 @@ rustyline = "17.0.2"
 [dev-dependencies]
 tempfile = "3.14"
 mockall = "0.13"
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "localgpt"

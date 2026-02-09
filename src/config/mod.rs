@@ -211,6 +211,15 @@ pub struct ServerConfig {
 
     #[serde(default = "default_bind")]
     pub bind: String,
+
+    /// Max API requests per minute (0 = unlimited).
+    #[serde(default = "default_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+
+    /// API key for HTTP server authentication.
+    /// Auto-generated on first run if empty.
+    #[serde(default)]
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +318,9 @@ fn default_port() -> u16 {
 fn default_bind() -> String {
     "127.0.0.1".to_string()
 }
+fn default_rate_limit_per_minute() -> u32 {
+    120
+}
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -374,6 +386,8 @@ impl Default for ServerConfig {
             enabled: default_true(),
             port: default_port(),
             bind: default_bind(),
+            rate_limit_per_minute: default_rate_limit_per_minute(),
+            api_key: String::new(),
         }
     }
 }
@@ -400,7 +414,8 @@ impl Config {
                 return Ok(migrated);
             }
             // Create default config file on first run
-            let config = Config::default();
+            let mut config = Config::default();
+            config.ensure_api_key();
             config.save_with_template()?;
             return Ok(config);
         }
@@ -410,6 +425,11 @@ impl Config {
 
         // Expand environment variables in API keys
         config.expand_env_vars();
+
+        // Auto-generate server API key if missing
+        if config.ensure_api_key() {
+            config.save()?;
+        }
 
         Ok(config)
     }
@@ -450,6 +470,16 @@ impl Config {
         Ok(base.home_dir().join(".localgpt").join("config.toml"))
     }
 
+    /// Generate a random API key if one is not set. Returns true if a key was generated.
+    pub fn ensure_api_key(&mut self) -> bool {
+        if self.server.api_key.is_empty() {
+            self.server.api_key = uuid::Uuid::new_v4().to_string();
+            true
+        } else {
+            false
+        }
+    }
+
     fn expand_env_vars(&mut self) {
         if let Some(ref mut openai) = self.providers.openai {
             openai.api_key = expand_env(&openai.api_key);
@@ -471,6 +501,10 @@ impl Config {
             ["server", "enabled"] => Ok(self.server.enabled.to_string()),
             ["server", "port"] => Ok(self.server.port.to_string()),
             ["server", "bind"] => Ok(self.server.bind.clone()),
+            ["server", "rate_limit_per_minute"] => {
+                Ok(self.server.rate_limit_per_minute.to_string())
+            }
+            ["server", "api_key"] => Ok(self.server.api_key.clone()),
             ["memory", "workspace"] => Ok(self.memory.workspace.clone()),
             ["logging", "level"] => Ok(self.logging.level.clone()),
             _ => anyhow::bail!("Unknown config key: {}", key),
@@ -489,6 +523,10 @@ impl Config {
             ["server", "enabled"] => self.server.enabled = value.parse()?,
             ["server", "port"] => self.server.port = value.parse()?,
             ["server", "bind"] => self.server.bind = value.to_string(),
+            ["server", "rate_limit_per_minute"] => {
+                self.server.rate_limit_per_minute = value.parse()?
+            }
+            ["server", "api_key"] => self.server.api_key = value.to_string(),
             ["memory", "workspace"] => self.memory.workspace = value.to_string(),
             ["logging", "level"] => self.logging.level = value.to_string(),
             _ => anyhow::bail!("Unknown config key: {}", key),
@@ -596,6 +634,10 @@ workspace = "~/.localgpt/workspace"
 enabled = true
 port = 31327
 bind = "127.0.0.1"
+# Max API requests per minute (0 = unlimited)
+# rate_limit_per_minute = 120
+# API key for authenticating HTTP requests (auto-generated if empty)
+# api_key = ""
 
 [logging]
 level = "info"

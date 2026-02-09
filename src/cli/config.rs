@@ -150,6 +150,8 @@ workspace = "~/.localgpt/workspace"
 enabled = true
 port = 31327
 bind = "127.0.0.1"
+# rate_limit_per_minute = 120
+# api_key = ""
 
 [logging]
 level = "info"

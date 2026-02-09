@@ -185,6 +185,7 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
             "  Server: http://{}:{}",
             config.server.bind, config.server.port
         );
+        println!("  API key: {}...", &config.server.api_key[..8]);
         let server = Server::new_with_gate(config, turn_gate)?;
         server.run().await?;
     } else if heartbeat_handle.is_some() {

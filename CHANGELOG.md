@@ -4,6 +4,22 @@
 
 ### Security
 
+#### API key auth and CORS restriction for HTTP server (SEC-02)
+
+The HTTP server previously exposed all API endpoints with no authentication
+and wildcard CORS (`allow_origin(Any)`), allowing any website to silently
+call the API via JavaScript.
+
+Changes:
+- All `/api/*` routes now require a bearer token (`Authorization: Bearer <key>`)
+  or a valid `api_key` query parameter. The embedded web UI bypasses auth
+  automatically via `Sec-Fetch-Site: same-origin` (loopback bind only).
+- CORS restricted to `localhost:<port>` origins only (was `Any`).
+- API key auto-generated (UUID v4) on first run and persisted to config.
+- Non-loopback bind address triggers a warning log.
+- Rate limiting added: configurable via `server.rate_limit_per_minute`
+  (default 120 requests/minute, 0 = unlimited).
+
 #### File tools sandboxed to prevent unrestricted filesystem access (SEC-01)
 
 File tools (`read_file`, `write_file`, `edit_file`) now validate all paths

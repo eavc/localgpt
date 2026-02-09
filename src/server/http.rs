@@ -9,7 +9,8 @@ use axum::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware,
     response::{
         sse::{Event, Sse},
         IntoResponse, Json, Response,
@@ -23,12 +24,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, info};
+use tower_http::cors::CorsLayer;
+use tracing::{debug, info, warn};
 
 use crate::agent::{extract_tool_detail, Agent, AgentConfig, StreamEvent};
 use crate::concurrency::{TurnGate, WorkspaceLock};
@@ -71,6 +72,119 @@ struct AppState {
     turn_gate: TurnGate,
     /// Cross-process workspace lock
     workspace_lock: WorkspaceLock,
+    /// API key for bearer token auth
+    api_key: String,
+    /// Rate limiter for API routes
+    rate_limiter: Mutex<RateLimiter>,
+}
+
+struct RateLimiter {
+    window_start: Instant,
+    count: u32,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            count: 0,
+        }
+    }
+
+    fn allow(&mut self, limit: u32) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_start) >= Duration::from_secs(60) {
+            self.window_start = now;
+            self.count = 0;
+        }
+        if self.count < limit {
+            self.count += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Rate limit middleware for API routes.
+async fn enforce_rate_limit(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let limit = state.config.server.rate_limit_per_minute;
+    if limit == 0 {
+        return next.run(request).await;
+    }
+
+    let allowed = {
+        let mut limiter = state.rate_limiter.lock().await;
+        limiter.allow(limit)
+    };
+
+    if !allowed {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests: rate limit exceeded",
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
+/// Auth middleware: validates API key via bearer token, query param, or same-origin bypass.
+async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    // 1. Same-origin bypass: allow requests from the embedded UI.
+    //    Sec-Fetch-Site is a browser-enforced forbidden header (cannot be spoofed by JS).
+    //    Only trust it when bound to loopback to prevent network-level spoofing.
+    let bind = &state.config.server.bind;
+    if is_loopback_bind(bind) {
+        if let Some(fetch_site) = request.headers().get("sec-fetch-site") {
+            if let Ok(value) = fetch_site.to_str() {
+                if value == "same-origin" {
+                    return next.run(request).await;
+                }
+            }
+        }
+    }
+
+    // 2. Bearer token auth (case-insensitive scheme per RFC 7235)
+    if let Some(auth_header) = request.headers().get(header::AUTHORIZATION) {
+        if let Ok(value) = auth_header.to_str() {
+            let parts: Vec<&str> = value.splitn(2, ' ').collect();
+            if parts.len() == 2
+                && parts[0].eq_ignore_ascii_case("bearer")
+                && parts[1] == state.api_key
+            {
+                return next.run(request).await;
+            }
+        }
+        // Invalid auth header — fall through to 401
+    }
+
+    // 3. Query param fallback (?api_key=...)
+    if let Some(query) = request.uri().query() {
+        for pair in query.split('&') {
+            if let Some(key) = pair.strip_prefix("api_key=") {
+                if key == state.api_key {
+                    return next.run(request).await;
+                }
+            }
+        }
+    }
+
+    // 4. Reject
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        "Unauthorized: provide a valid API key via Authorization header or api_key query param",
+    )
+        .into_response()
 }
 
 impl Server {
@@ -103,6 +217,8 @@ impl Server {
             memory,
             turn_gate: self.turn_gate.clone(),
             workspace_lock,
+            api_key: self.config.server.api_key.clone(),
+            rate_limiter: Mutex::new(RateLimiter::new()),
         });
 
         // Load persisted sessions on startup
@@ -130,17 +246,26 @@ impl Server {
             }
         });
 
-        let cors = CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
+        let port = self.config.server.port;
 
-        let app = Router::new()
-            // Web UI routes
-            .route("/", get(serve_ui_index))
-            .route("/ui/{*path}", get(serve_ui_file))
-            // API routes
-            .route("/health", get(health_check))
+        // CORS: only allow localhost origins (not wildcard)
+        let cors = CorsLayer::new()
+            .allow_origin([
+                format!("http://127.0.0.1:{}", port)
+                    .parse::<HeaderValue>()
+                    .expect("valid origin"),
+                format!("http://localhost:{}", port)
+                    .parse::<HeaderValue>()
+                    .expect("valid origin"),
+                format!("http://[::1]:{}", port)
+                    .parse::<HeaderValue>()
+                    .expect("valid origin"),
+            ])
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+
+        // Protected API routes (require auth)
+        let api_routes = Router::new()
             .route("/api/sessions", post(create_session))
             .route("/api/sessions", get(list_sessions))
             .route("/api/sessions/{session_id}", delete(delete_session))
@@ -164,11 +289,36 @@ impl Server {
             .route("/api/saved-sessions", get(list_saved_sessions))
             .route("/api/saved-sessions/{session_id}", get(get_saved_session))
             .route("/api/logs/daemon", get(get_daemon_logs))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_key,
+            ))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                enforce_rate_limit,
+            ));
+
+        // Public routes (no auth)
+        let public_routes = Router::new()
+            .route("/", get(serve_ui_index))
+            .route("/ui/{*path}", get(serve_ui_file))
+            .route("/health", get(health_check));
+
+        let app = public_routes
+            .merge(api_routes)
             .layer(cors)
             .with_state(state);
 
         let addr: SocketAddr =
             format!("{}:{}", self.config.server.bind, self.config.server.port).parse()?;
+
+        // Warn if binding to a non-loopback address
+        if !is_loopback_bind(&self.config.server.bind) {
+            warn!(
+                "Server binding to non-loopback address '{}'. This exposes the API to the network.",
+                self.config.server.bind
+            );
+        }
 
         info!("Starting HTTP server on http://{}", addr);
 
@@ -1511,4 +1661,206 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     debug!("WebSocket connection closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Build a minimal test app with auth middleware and a test API endpoint.
+    fn test_app(api_key: &str, bind: &str, rate_limit_per_minute: u32) -> Router {
+        let mut config = Config::default();
+        config.server.bind = bind.to_string();
+        config.server.rate_limit_per_minute = rate_limit_per_minute;
+        let state = Arc::new(AppState {
+            config,
+            sessions: Mutex::new(HashMap::new()),
+            memory: MemoryManager::new_stub(),
+            turn_gate: TurnGate::new(),
+            workspace_lock: WorkspaceLock::new().unwrap(),
+            api_key: api_key.to_string(),
+            rate_limiter: Mutex::new(RateLimiter::new()),
+        });
+
+        let api_routes = Router::new()
+            .route("/api/status", get(|| async { "protected" }))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_api_key,
+            ))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                enforce_rate_limit,
+            ));
+
+        let public_routes = Router::new().route("/health", get(|| async { "ok" }));
+
+        public_routes.merge(api_routes).with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_health_no_auth_required() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_requires_auth() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_wrong_key_rejected() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Authorization", "Bearer wrong-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_correct_bearer_accepted() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Authorization", "Bearer test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_api_query_param_accepted() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status?api_key=test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_same_origin_bypasses_auth() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_sec_fetch_none_requires_auth() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Sec-Fetch-Site", "none")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_cross_site_requires_auth() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Sec-Fetch-Site", "cross-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_same_origin_bypass_rejected_on_non_loopback() {
+        let app = test_app("test-key-123", "0.0.0.0", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_enforced() {
+        let app = test_app("test-key-123", "127.0.0.1", 2);
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/status")
+                        .header("Authorization", "Bearer test-key-123")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Authorization", "Bearer test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    if bind == "localhost" {
+        return true;
+    }
+    match bind.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
