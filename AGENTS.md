@@ -27,19 +27,19 @@ cargo fmt --check
 
 ## Git Workflow
 
-This project uses **git flow** with a `development` branch for integration:
+Always **rebase**, never merge (keeps history linear):
 
 - **`main`** — stable, production-ready code
 - **`development`** — integration branch for completed features/fixes
-- **Feature/fix branches** — branch from `development`, merge back with `--no-ff` to preserve topology, then rebase `development` onto `main` when releasing to keep linear history
+- **Feature/fix branches** — branch from `development`, rebase onto `development` when done
 
 ```bash
 # Start work
 git checkout -b feat/my-feature development
 
-# Merge completed work (preserves branch topology)
+# Integrate completed work (linear history)
 git checkout development
-git merge --no-ff feat/my-feature
+git rebase feat/my-feature          # fast-forward
 
 # Release to main (linear history)
 git checkout main
