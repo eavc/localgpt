@@ -178,6 +178,50 @@ pub fn create_default_tools(
     ])
 }
 
+/// Create a restricted tool set for the heartbeat agent.
+///
+/// Only tools named in `config.heartbeat.allowed_tools` are instantiated.
+/// Tools not on the allowlist simply do not exist in the returned vec —
+/// this is a hard construction-time restriction, not a runtime gate.
+///
+/// Implementation note: we construct all default tools then filter down to the
+/// allowlist. This is slightly wasteful (discarded tools are allocated then
+/// dropped) but keeps the logic simple — a name→constructor factory would add
+/// complexity that isn't justified for the small number of tools involved.
+pub fn create_heartbeat_tools(
+    config: &Config,
+    memory: Option<Arc<MemoryManager>>,
+) -> Result<Vec<Box<dyn Tool>>> {
+    let all_tools = create_default_tools(config, memory)?;
+    let total = all_tools.len();
+    let allowed = &config.heartbeat.allowed_tools;
+
+    let filtered: Vec<Box<dyn Tool>> = all_tools
+        .into_iter()
+        .filter(|t| allowed.iter().any(|a| a == t.name()))
+        .collect();
+
+    // Warn about allowlist entries that don't match any known tool (config typos)
+    let matched_names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
+    for name in allowed {
+        if !matched_names.contains(&name.as_str()) {
+            warn!(
+                "Heartbeat allowed_tools entry {:?} does not match any known tool — check config for typos",
+                name
+            );
+        }
+    }
+
+    debug!(
+        "Heartbeat tools: {} of {} total allowed ({:?})",
+        filtered.len(),
+        total,
+        matched_names
+    );
+
+    Ok(filtered)
+}
+
 // Bash Tool
 pub struct BashTool {
     default_timeout_ms: u64,
@@ -1207,5 +1251,57 @@ mod tests {
         let result = tool.execute(&args).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_create_heartbeat_tools_uses_default_allowlist() {
+        let config = Config::default();
+        let tools = create_heartbeat_tools(&config, None).unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        // Default allowlist: memory_search, memory_get, read_file (read-only)
+        assert!(names.contains(&"memory_search"), "missing memory_search");
+        assert!(names.contains(&"memory_get"), "missing memory_get");
+        assert!(names.contains(&"read_file"), "missing read_file");
+
+        // bash, write_file, edit_file, and web_fetch must NOT be present
+        assert!(!names.contains(&"bash"), "bash should be excluded");
+        assert!(
+            !names.contains(&"write_file"),
+            "write_file should be excluded"
+        );
+        assert!(
+            !names.contains(&"edit_file"),
+            "edit_file should be excluded by default"
+        );
+        assert!(
+            !names.contains(&"web_fetch"),
+            "web_fetch should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_create_heartbeat_tools_custom_allowlist() {
+        let toml_str = r#"
+            [heartbeat]
+            allowed_tools = ["memory_search"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let tools = create_heartbeat_tools(&config, None).unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        assert_eq!(names, vec!["memory_search"]);
+    }
+
+    #[test]
+    fn test_create_heartbeat_tools_empty_allowlist() {
+        let toml_str = r#"
+            [heartbeat]
+            allowed_tools = []
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let tools = create_heartbeat_tools(&config, None).unwrap();
+
+        assert!(tools.is_empty(), "empty allowlist should produce no tools");
     }
 }

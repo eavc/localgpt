@@ -128,6 +128,33 @@ impl Agent {
         })
     }
 
+    /// Create an agent with a restricted tool set for heartbeat operation.
+    ///
+    /// Only tools listed in `config.heartbeat.allowed_tools` are available.
+    /// The execution context is forced to `NonInteractive` — tools in
+    /// `require_approval` are additionally denied at runtime as defense
+    /// in depth.
+    pub async fn new_for_heartbeat(
+        config: AgentConfig,
+        app_config: &Config,
+        memory: MemoryManager,
+    ) -> Result<Self> {
+        let provider = providers::create_provider(&config.model, app_config)?;
+        let memory = Arc::new(memory);
+        let tools = tools::create_heartbeat_tools(app_config, Some(Arc::clone(&memory)))?;
+
+        Ok(Self {
+            config,
+            app_config: app_config.clone(),
+            provider,
+            session: Session::new(),
+            memory,
+            tools,
+            cumulative_usage: Usage::default(),
+            execution_context: ExecutionContext::NonInteractive,
+        })
+    }
+
     pub fn model(&self) -> &str {
         &self.config.model
     }
@@ -1368,6 +1395,121 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("Unknown tool"),
             "Unknown tool should bypass approval and hit the Unknown tool error"
+        );
+    }
+
+    /// Helper to build a heartbeat agent for testing tool restriction.
+    async fn build_heartbeat_test_agent(config: &Config) -> Agent {
+        let mut config = config.clone();
+        config.providers.ollama = Some(crate::config::OllamaConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "test".to_string(),
+        });
+        let memory = MemoryManager::new_stub();
+        let agent_config = AgentConfig {
+            model: "ollama/test".to_string(),
+            context_window: 4096,
+            reserve_tokens: 512,
+        };
+        Agent::new_for_heartbeat(agent_config, &config, memory)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_agent_excludes_bash() {
+        let agent = build_heartbeat_test_agent(&Config::default()).await;
+        let tool_names: Vec<&str> = agent.tools.iter().map(|t| t.name()).collect();
+
+        assert!(
+            !tool_names.contains(&"bash"),
+            "Heartbeat agent must not have bash: got {:?}",
+            tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_agent_excludes_web_fetch() {
+        let agent = build_heartbeat_test_agent(&Config::default()).await;
+        let tool_names: Vec<&str> = agent.tools.iter().map(|t| t.name()).collect();
+
+        assert!(
+            !tool_names.contains(&"web_fetch"),
+            "Heartbeat agent must not have web_fetch: got {:?}",
+            tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_agent_excludes_write_file() {
+        let agent = build_heartbeat_test_agent(&Config::default()).await;
+        let tool_names: Vec<&str> = agent.tools.iter().map(|t| t.name()).collect();
+
+        assert!(
+            !tool_names.contains(&"write_file"),
+            "Heartbeat agent must not have write_file: got {:?}",
+            tool_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_agent_has_allowed_tools() {
+        let agent = build_heartbeat_test_agent(&Config::default()).await;
+        let tool_names: Vec<&str> = agent.tools.iter().map(|t| t.name()).collect();
+
+        // Default heartbeat is read-only: memory_search, memory_get, read_file
+        assert!(
+            tool_names.contains(&"memory_search"),
+            "Heartbeat agent should have memory_search"
+        );
+        assert!(
+            tool_names.contains(&"memory_get"),
+            "Heartbeat agent should have memory_get"
+        );
+        assert!(
+            tool_names.contains(&"read_file"),
+            "Heartbeat agent should have read_file"
+        );
+        // edit_file is NOT in the default allowlist (read-only by default)
+        assert!(
+            !tool_names.contains(&"edit_file"),
+            "Heartbeat agent should not have edit_file by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_agent_is_noninteractive() {
+        let agent = build_heartbeat_test_agent(&Config::default()).await;
+        assert_eq!(
+            agent.execution_context(),
+            ExecutionContext::NonInteractive,
+            "Heartbeat agent must be NonInteractive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_agent_bash_blocked_even_without_approval_list() {
+        // Even with an empty require_approval list, bash is absent from the
+        // heartbeat agent's tool vec (construction-time restriction).
+        let toml_str = r#"
+            [tools]
+            require_approval = []
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let agent = build_heartbeat_test_agent(&config).await;
+
+        let call = ToolCall {
+            id: "hb-bash".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"echo pwned"}"#.to_string(),
+        };
+
+        let result = agent.execute_tool(&call).await;
+        assert!(result.is_err(), "bash should fail on heartbeat agent");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown tool"),
+            "With empty approval list, bash should be unknown (truly absent): got {err}"
         );
     }
 }

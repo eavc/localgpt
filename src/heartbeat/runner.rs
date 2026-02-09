@@ -233,14 +233,15 @@ impl HeartbeatRunner {
             return Ok((HEARTBEAT_OK_TOKEN.to_string(), HeartbeatStatus::Skipped));
         }
 
-        // Create agent for heartbeat (clone the cached MemoryManager to share the embedding provider)
+        // Create agent for heartbeat with restricted tool set
         let agent_config = AgentConfig {
             model: self.config.agent.default_model.clone(),
             context_window: self.config.agent.context_window,
             reserve_tokens: self.config.agent.reserve_tokens,
         };
 
-        let mut agent = Agent::new(agent_config, &self.config, self.memory.clone()).await?;
+        let mut agent =
+            Agent::new_for_heartbeat(agent_config, &self.config, self.memory.clone()).await?;
         agent.new_session().await?;
 
         // Check if workspace is a git repo

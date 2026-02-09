@@ -66,6 +66,16 @@ interval = "30m"
 # start = "09:00"
 # end = "22:00"
 
+# Tools available to the heartbeat agent. Only these tools are created
+# for heartbeat sessions — excluded tools do not exist and cannot be
+# invoked even via prompt injection.
+# Default: ["memory_search", "memory_get", "read_file"] (read-only)
+#
+# To allow the heartbeat to mark tasks complete, add "edit_file" and
+# remove it from tools.require_approval:
+#   allowed_tools = ["memory_search", "memory_get", "read_file", "edit_file"]
+# allowed_tools = ["memory_search", "memory_get", "read_file"]
+
 [memory]
 # Where to store memory files
 workspace = "~/.localgpt/workspace"

@@ -148,6 +148,19 @@ pub struct HeartbeatConfig {
 
     #[serde(default)]
     pub timezone: Option<String>,
+
+    /// Allowlist of tools available to the heartbeat agent.
+    /// Only these tools are created for heartbeat sessions — tools not on
+    /// this list simply do not exist in the agent and cannot be invoked.
+    /// Default: ["memory_search", "memory_get", "read_file"]
+    ///
+    /// The default set is read-only: the heartbeat can inspect workspace
+    /// files and search memory, but cannot execute commands, write files,
+    /// or make network requests. To allow the heartbeat to mark tasks
+    /// complete in HEARTBEAT.md, add "edit_file" here AND remove it from
+    /// tools.require_approval (since heartbeat runs in NonInteractive mode).
+    #[serde(default = "default_heartbeat_allowed_tools")]
+    pub allowed_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +376,14 @@ impl Default for ToolsConfig {
     }
 }
 
+fn default_heartbeat_allowed_tools() -> Vec<String> {
+    vec![
+        "memory_search".to_string(),
+        "memory_get".to_string(),
+        "read_file".to_string(),
+    ]
+}
+
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
@@ -370,6 +391,7 @@ impl Default for HeartbeatConfig {
             interval: default_interval(),
             active_hours: None,
             timezone: None,
+            allowed_tools: default_heartbeat_allowed_tools(),
         }
     }
 }
@@ -621,6 +643,10 @@ interval = "30m"
 # [heartbeat.active_hours]
 # start = "09:00"
 # end = "22:00"
+
+# Tools available to the heartbeat agent (read-only by default).
+# Default: ["memory_search", "memory_get", "read_file"]
+# allowed_tools = ["memory_search", "memory_get", "read_file"]
 
 [memory]
 # Workspace directory for memory files (MEMORY.md, HEARTBEAT.md, etc.)
