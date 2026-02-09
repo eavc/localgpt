@@ -59,9 +59,11 @@ pub struct ToolsConfig {
     #[serde(default = "default_web_fetch_max_bytes")]
     pub web_fetch_max_bytes: usize,
 
-    /// Tools that require user approval before execution
-    /// e.g., ["bash", "write_file", "edit_file"]
-    #[serde(default)]
+    /// Tools that require user approval before execution.
+    /// Default: ["bash", "write_file", "edit_file"].
+    /// In non-interactive contexts (HTTP, heartbeat), these tools are denied.
+    /// Set to [] to disable approval requirements.
+    #[serde(default = "default_require_approval")]
     pub require_approval: Vec<String>,
 
     /// Maximum characters for tool output (0 = unlimited)
@@ -339,12 +341,20 @@ impl Default for AgentConfig {
     }
 }
 
+fn default_require_approval() -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        "write_file".to_string(),
+        "edit_file".to_string(),
+    ]
+}
+
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             bash_timeout_ms: default_bash_timeout(),
             web_fetch_max_bytes: default_web_fetch_max_bytes(),
-            require_approval: Vec::new(),
+            require_approval: default_require_approval(),
             tool_output_max_chars: default_tool_output_max_chars(),
             log_injection_warnings: default_true(),
             use_content_delimiters: default_true(),
@@ -624,6 +634,12 @@ workspace = "~/.localgpt/workspace"
 # session_max_chars = 0        # Max chars per message (0 = unlimited, preserves full content)
 
 [tools]
+# Tools that require user approval before execution.
+# In CLI interactive chat, the user is prompted before running these tools.
+# In non-interactive contexts (HTTP API, heartbeat, ask), these tools are
+# denied outright. Set to [] to disable approval requirements.
+# require_approval = ["bash", "write_file", "edit_file"]
+
 # Additional paths that file tools (read_file, write_file, edit_file) may access.
 # The workspace directory is always allowed. Paths are tilde-expanded and
 # canonicalized at startup; entries that do not exist on disk are silently

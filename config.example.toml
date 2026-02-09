@@ -112,6 +112,13 @@ chunk_size = 400
 chunk_overlap = 80
 
 [tools]
+# Tools that require user approval before execution.
+# In CLI interactive chat, the user is prompted before running these tools.
+# In non-interactive contexts (HTTP API, heartbeat, ask), these tools are
+# denied outright. Set to [] to disable approval requirements.
+# Default: ["bash", "write_file", "edit_file"]
+# require_approval = ["bash", "write_file", "edit_file"]
+
 # Additional paths that file tools (read_file, write_file, edit_file) may access.
 # The workspace directory is always allowed. Paths are tilde-expanded and
 # canonicalized at startup; entries that do not exist on disk are silently

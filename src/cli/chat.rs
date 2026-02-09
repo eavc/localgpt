@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use localgpt::agent::{
     extract_tool_detail, get_last_session_id_for_agent, get_skills_summary,
     list_sessions_for_agent, load_skills, parse_skill_command, search_sessions_for_agent, Agent,
-    AgentConfig, ImageAttachment, Skill,
+    AgentConfig, ExecutionContext, ImageAttachment, Skill,
 };
 use localgpt::concurrency::WorkspaceLock;
 use localgpt::config::Config;
@@ -126,6 +126,7 @@ pub async fn run(args: ChatArgs, agent_id: &str) -> Result<()> {
     };
 
     let mut agent = Agent::new(agent_config, &config, memory).await?;
+    agent.set_execution_context(ExecutionContext::Interactive);
     let workspace_lock = WorkspaceLock::new()?;
 
     // Determine session to use

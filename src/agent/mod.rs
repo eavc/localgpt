@@ -31,10 +31,34 @@ pub use tools::{extract_tool_detail, Tool, ToolResult};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::memory::{MemoryChunk, MemoryManager};
+
+/// Execution context determines how tool approval is enforced.
+///
+/// - `Interactive`: The caller can prompt the user for approval (CLI chat).
+///   `execute_tool()` runs normally; the caller is responsible for
+///   presenting approval prompts before calling it (the CLI streaming
+///   path already does this).
+/// - `NonInteractive`: No human is in the loop (HTTP API, WebSocket,
+///   heartbeat, `ask` subcommand). Tools listed in `require_approval`
+///   are denied in `execute_tool()` and a descriptive error message is
+///   returned to the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionContext {
+    /// CLI interactive chat — can prompt user for approval
+    Interactive,
+    /// HTTP, WebSocket, heartbeat, `ask` — no human in the loop
+    NonInteractive,
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self::NonInteractive
+    }
+}
 
 /// Soft threshold buffer before compaction (tokens)
 /// Memory flush runs when within this buffer of the hard limit
@@ -74,6 +98,8 @@ pub struct Agent {
     tools: Vec<Box<dyn Tool>>,
     /// Cumulative token usage for this session
     cumulative_usage: Usage,
+    /// Execution context controls tool approval enforcement
+    execution_context: ExecutionContext,
 }
 
 impl Agent {
@@ -96,6 +122,9 @@ impl Agent {
             memory,
             tools,
             cumulative_usage: Usage::default(),
+            // Safe default: NonInteractive denies tools requiring approval.
+            // CLI callers must explicitly opt in via set_execution_context().
+            execution_context: ExecutionContext::default(),
         })
     }
 
@@ -115,6 +144,21 @@ impl Agent {
     /// Get the list of tools that require approval
     pub fn approval_required_tools(&self) -> &[String] {
         &self.app_config.tools.require_approval
+    }
+
+    /// Set the execution context for tool approval enforcement.
+    ///
+    /// - `Interactive`: tool approval errors are returned so the caller
+    ///   can prompt the user (used by CLI chat).
+    /// - `NonInteractive`: tools requiring approval are denied outright
+    ///   (used by HTTP API, WebSocket, heartbeat, `ask`).
+    pub fn set_execution_context(&mut self, ctx: ExecutionContext) {
+        self.execution_context = ctx;
+    }
+
+    /// Get the current execution context.
+    pub fn execution_context(&self) -> ExecutionContext {
+        self.execution_context
     }
 
     /// Switch to a different model
@@ -341,7 +385,40 @@ impl Agent {
         }
     }
 
+    /// Execute a tool call, enforcing approval policy in non-interactive contexts.
+    ///
+    /// When the execution context is `NonInteractive` (HTTP API, WebSocket,
+    /// heartbeat, `ask` subcommand), tools listed in `tools.require_approval`
+    /// are denied and a descriptive message is returned to the LLM instead of
+    /// executing the tool.
+    ///
+    /// In `Interactive` mode (CLI chat), the caller is responsible for
+    /// presenting approval prompts before calling this method. The streaming
+    /// CLI path already does this.
     async fn execute_tool(&self, call: &ToolCall) -> Result<String> {
+        // Enforce tool approval policy in non-interactive contexts
+        if self.execution_context == ExecutionContext::NonInteractive
+            && self.requires_approval(&call.name)
+        {
+            warn!(
+                "Tool '{}' denied: requires approval but context is non-interactive",
+                call.name
+            );
+            let denial_msg = format!(
+                "Error: Tool '{}' requires user approval and cannot be executed \
+                 in this context (HTTP API, heartbeat, or non-interactive mode). \
+                 The tool is listed in tools.require_approval in config.toml. \
+                 Remove it from that list to allow execution in non-interactive contexts.",
+                call.name
+            );
+            // Wrap denial through sanitization for consistent output framing
+            if self.app_config.tools.use_content_delimiters {
+                let result = sanitize::wrap_tool_output(&call.name, &denial_msg, None);
+                return Ok(result.content);
+            }
+            return Ok(denial_msg);
+        }
+
         for tool in &self.tools {
             if tool.name() == call.name {
                 let raw_output = tool.execute(&call.arguments).await?;
@@ -1013,6 +1090,272 @@ impl Agent {
     /// Auto-save session to disk (call after each message)
     pub fn auto_save_session(&self) -> Result<()> {
         self.session.auto_save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::memory::MemoryManager;
+
+    #[test]
+    fn test_default_config_has_require_approval() {
+        let config = Config::default();
+        assert!(
+            config.tools.require_approval.contains(&"bash".to_string()),
+            "Default config should require approval for bash"
+        );
+        assert!(
+            config
+                .tools
+                .require_approval
+                .contains(&"write_file".to_string()),
+            "Default config should require approval for write_file"
+        );
+        assert!(
+            config
+                .tools
+                .require_approval
+                .contains(&"edit_file".to_string()),
+            "Default config should require approval for edit_file"
+        );
+    }
+
+    #[test]
+    fn test_empty_require_approval_from_toml() {
+        let toml_str = r#"
+            [tools]
+            require_approval = []
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(
+            config.tools.require_approval.is_empty(),
+            "Empty require_approval should be respected"
+        );
+    }
+
+    #[test]
+    fn test_custom_require_approval_from_toml() {
+        let toml_str = r#"
+            [tools]
+            require_approval = ["bash"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.tools.require_approval, vec!["bash"]);
+    }
+
+    #[test]
+    fn test_execution_context_default() {
+        let ctx = ExecutionContext::NonInteractive;
+        assert_eq!(ctx, ExecutionContext::NonInteractive);
+        assert_ne!(ctx, ExecutionContext::Interactive);
+
+        let ctx2 = ExecutionContext::Interactive;
+        assert_eq!(ctx2, ExecutionContext::Interactive);
+    }
+
+    /// Helper to build a minimal Agent for testing tool approval enforcement.
+    /// Uses ollama provider pointed at localhost (won't actually connect for chat,
+    /// but allows Agent construction).
+    async fn build_test_agent(config: &Config) -> Agent {
+        let mut config = config.clone();
+        // Ensure ollama provider is configured so create_provider succeeds
+        config.providers.ollama = Some(crate::config::OllamaConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "test".to_string(),
+        });
+        let memory = MemoryManager::new_stub();
+        let agent_config = AgentConfig {
+            model: "ollama/test".to_string(),
+            context_window: 4096,
+            reserve_tokens: 512,
+        };
+        let agent = Agent::new(agent_config, &config, memory).await.unwrap();
+        assert!(
+            !agent.tools.is_empty(),
+            "Test agent should have tools loaded"
+        );
+        agent
+    }
+
+    #[tokio::test]
+    async fn test_noninteractive_denies_tool_requiring_approval() {
+        let config = Config::default(); // has require_approval = ["bash", ...]
+        let agent = build_test_agent(&config).await;
+
+        // Default context is NonInteractive
+        assert_eq!(agent.execution_context(), ExecutionContext::NonInteractive);
+
+        let call = ToolCall {
+            id: "test-1".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"echo hello"}"#.to_string(),
+        };
+
+        let result = agent.execute_tool(&call).await;
+        let output = result.unwrap();
+        assert!(
+            output.contains("requires user approval"),
+            "NonInteractive should deny bash: got {output}"
+        );
+        assert!(
+            output.contains("bash"),
+            "Denial message should name the tool: got {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interactive_allows_tool_requiring_approval() {
+        let config = Config::default();
+        let mut agent = build_test_agent(&config).await;
+        agent.set_execution_context(ExecutionContext::Interactive);
+
+        let call = ToolCall {
+            id: "test-2".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"echo hello"}"#.to_string(),
+        };
+
+        let result = agent.execute_tool(&call).await;
+        let output = result.unwrap();
+        // In Interactive mode, bash should execute (echo hello → "hello\n")
+        assert!(
+            output.contains("hello"),
+            "Interactive should allow bash execution: got {output}"
+        );
+    }
+
+    /// Verifies that tools NOT in `require_approval` are not blocked by the
+    /// approval gate in NonInteractive mode — they pass through to actual
+    /// execution (which may fail for other reasons, e.g. missing file).
+    #[tokio::test]
+    async fn test_noninteractive_does_not_block_non_approval_tools() {
+        let config = Config::default();
+        let agent = build_test_agent(&config).await;
+
+        // read_file is NOT in the default require_approval list
+        assert!(!agent.requires_approval("read_file"));
+
+        let call = ToolCall {
+            id: "test-3".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"/nonexistent-test-file-12345"}"#.to_string(),
+        };
+
+        let result = agent.execute_tool(&call).await;
+        // Should fail with a file error, NOT an approval denial
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("requires user approval"),
+            "read_file should not be blocked by approval: got {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_approval_list_allows_all() {
+        let toml_str = r#"
+            [tools]
+            require_approval = []
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let agent = build_test_agent(&config).await;
+
+        // Even in NonInteractive mode, bash should run with empty approval list
+        assert_eq!(agent.execution_context(), ExecutionContext::NonInteractive);
+        assert!(!agent.requires_approval("bash"));
+
+        let call = ToolCall {
+            id: "test-4".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"echo allowed"}"#.to_string(),
+        };
+
+        let result = agent.execute_tool(&call).await;
+        let output = result.unwrap();
+        assert!(
+            output.contains("allowed"),
+            "Empty approval list should allow bash: got {output}"
+        );
+    }
+
+    #[test]
+    fn test_execution_context_default_is_noninteractive() {
+        assert_eq!(
+            ExecutionContext::default(),
+            ExecutionContext::NonInteractive
+        );
+    }
+
+    #[tokio::test]
+    async fn test_denial_wrapped_with_content_delimiters() {
+        let config = Config::default(); // use_content_delimiters = true
+        assert!(config.tools.use_content_delimiters);
+        let agent = build_test_agent(&config).await;
+
+        let call = ToolCall {
+            id: "test-delim".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"echo test"}"#.to_string(),
+        };
+
+        let output = agent.execute_tool(&call).await.unwrap();
+        assert!(
+            output.contains("<tool_output>"),
+            "Denial should be wrapped with start delimiter: {output}"
+        );
+        assert!(
+            output.contains("</tool_output>"),
+            "Denial should be wrapped with end delimiter: {output}"
+        );
+        assert!(output.contains("requires user approval"));
+    }
+
+    #[tokio::test]
+    async fn test_denial_raw_without_content_delimiters() {
+        let toml_str = r#"
+            [tools]
+            require_approval = ["bash"]
+            use_content_delimiters = false
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.tools.use_content_delimiters);
+        let agent = build_test_agent(&config).await;
+
+        let call = ToolCall {
+            id: "test-raw".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"echo test"}"#.to_string(),
+        };
+
+        let output = agent.execute_tool(&call).await.unwrap();
+        assert!(
+            !output.contains("<tool_output>"),
+            "Raw denial should not be wrapped: {output}"
+        );
+        assert!(
+            output.starts_with("Error:"),
+            "Should start with Error: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_tool_not_blocked_by_approval() {
+        let agent = build_test_agent(&Config::default()).await;
+
+        let call = ToolCall {
+            id: "test-unk".to_string(),
+            name: "nonexistent_tool".to_string(),
+            arguments: "{}".to_string(),
+        };
+
+        let result = agent.execute_tool(&call).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Unknown tool"),
+            "Unknown tool should bypass approval and hit the Unknown tool error"
+        );
     }
 }
 
