@@ -3,6 +3,7 @@
 //! The worker runs in a separate thread with its own tokio runtime.
 //! It receives commands from the UI and sends back status updates.
 
+use std::collections::HashMap;
 use std::pin::pin;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -11,13 +12,55 @@ use anyhow::Result;
 use futures::StreamExt;
 
 use crate::agent::{
-    extract_tool_detail, list_sessions_for_agent, Agent, AgentConfig, StreamEvent, ToolCall,
-    DEFAULT_AGENT_ID,
+    extract_tool_detail, list_sessions_for_agent, Agent, AgentConfig, ExecutionContext, ToolCall,
+    ToolResult, DEFAULT_AGENT_ID,
 };
 use crate::config::Config;
 use crate::memory::MemoryManager;
 
 use super::state::{UiMessage, WorkerMessage};
+
+struct PendingApproval {
+    response: String,
+    tool_calls: Vec<ToolCall>,
+}
+
+async fn execute_tool_calls_with_events(
+    agent: &mut Agent,
+    tx: &Sender<WorkerMessage>,
+    text_response: &str,
+    tool_calls: Vec<ToolCall>,
+) -> Result<()> {
+    let mut call_name_by_id: HashMap<String, String> = HashMap::new();
+
+    for call in &tool_calls {
+        let detail = extract_tool_detail(&call.name, &call.arguments);
+        call_name_by_id.insert(call.id.clone(), call.name.clone());
+        let _ = tx.send(WorkerMessage::ToolCallStart {
+            name: call.name.clone(),
+            id: call.id.clone(),
+            detail,
+        });
+    }
+
+    let (follow_up, results) = agent
+        .execute_streaming_tool_calls_with_results(text_response, tool_calls)
+        .await?;
+
+    for ToolResult { call_id, output } in results {
+        if let Some(name) = call_name_by_id.get(&call_id) {
+            let _ = tx.send(WorkerMessage::ToolCallEnd {
+                name: name.clone(),
+                id: call_id,
+                output,
+            });
+        }
+    }
+
+    let _ = tx.send(WorkerMessage::ContentChunk(follow_up));
+    let _ = tx.send(WorkerMessage::Done);
+    Ok(())
+}
 
 /// Handle to the background worker
 pub struct WorkerHandle {
@@ -86,6 +129,7 @@ async fn worker_loop(
     };
 
     let mut agent = Agent::new(agent_config, &config, memory).await?;
+    agent.set_execution_context(ExecutionContext::Interactive);
     agent.new_session().await?;
 
     // Send ready message
@@ -106,70 +150,76 @@ async fn worker_loop(
     // Track tools requiring approval
     let approval_tools: Vec<String> = agent.approval_required_tools().to_vec();
 
+    let mut pending_approval: Option<PendingApproval> = None;
+
     // Main loop
     while let Ok(msg) = rx.recv() {
         let mut should_auto_save = false;
 
         match msg {
             UiMessage::Chat(message) => {
-                // Stream response with tool support
-                match agent.chat_stream_with_tools(&message).await {
+                if pending_approval.is_some() {
+                    let _ = tx.send(WorkerMessage::SystemMessage(
+                        "Approve or deny pending tools before sending a new message.".to_string(),
+                    ));
+                    continue;
+                }
+
+                // Stream response (tool calls collected for approval)
+                match agent.chat_stream(&message).await {
                     Ok(stream) => {
                         let mut stream = pin!(stream);
-                        let mut pending_tools: Vec<ToolCall> = Vec::new();
+                        let mut full_response = String::new();
+                        let mut pending_tool_calls: Option<Vec<ToolCall>> = None;
 
                         while let Some(result) = stream.next().await {
                             match result {
-                                Ok(event) => match event {
-                                    StreamEvent::Content(text) => {
-                                        let _ = tx.send(WorkerMessage::ContentChunk(text));
+                                Ok(chunk) => {
+                                    if !chunk.delta.is_empty() {
+                                        let _ = tx
+                                            .send(WorkerMessage::ContentChunk(chunk.delta.clone()));
+                                        full_response.push_str(&chunk.delta);
                                     }
-                                    StreamEvent::ToolCallStart {
-                                        name,
-                                        id,
-                                        arguments,
-                                    } => {
-                                        // Check if this tool requires approval
-                                        if approval_tools.contains(&name) {
-                                            // Collect for approval
-                                            pending_tools.push(ToolCall {
-                                                id,
-                                                name,
-                                                arguments: String::new(),
-                                            });
-                                        } else {
-                                            let detail = extract_tool_detail(&name, &arguments);
-                                            let _ = tx.send(WorkerMessage::ToolCallStart {
-                                                name,
-                                                id,
-                                                detail,
-                                            });
-                                        }
+
+                                    if chunk.done && chunk.tool_calls.is_some() {
+                                        pending_tool_calls = chunk.tool_calls;
                                     }
-                                    StreamEvent::ToolCallEnd { name, id, output } => {
-                                        let _ = tx.send(WorkerMessage::ToolCallEnd {
-                                            name,
-                                            id,
-                                            output,
-                                        });
-                                    }
-                                    StreamEvent::Done => {
-                                        if !pending_tools.is_empty() {
-                                            let _ = tx.send(WorkerMessage::ToolsPendingApproval(
-                                                pending_tools.clone(),
-                                            ));
-                                            pending_tools.clear();
-                                        } else {
-                                            let _ = tx.send(WorkerMessage::Done);
-                                        }
-                                        should_auto_save = true;
-                                    }
-                                },
+                                }
                                 Err(e) => {
                                     let _ = tx.send(WorkerMessage::Error(e.to_string()));
                                     break;
                                 }
                             }
+                        }
+
+                        if let Some(tool_calls) = pending_tool_calls {
+                            let needs_approval = tool_calls
+                                .iter()
+                                .any(|tc| approval_tools.contains(&tc.name));
+
+                            if needs_approval {
+                                pending_approval = Some(PendingApproval {
+                                    response: full_response,
+                                    tool_calls: tool_calls.clone(),
+                                });
+                                let _ = tx.send(WorkerMessage::ToolsPendingApproval(tool_calls));
+                            } else if let Err(e) = execute_tool_calls_with_events(
+                                &mut agent,
+                                &tx,
+                                &full_response,
+                                tool_calls,
+                            )
+                            .await
+                            {
+                                let _ = tx.send(WorkerMessage::Error(e.to_string()));
+                            } else {
+                                should_auto_save = true;
+                            }
+                        } else {
+                            // No tool calls - just finish the stream
+                            agent.finish_chat_stream(&full_response);
+                            let _ = tx.send(WorkerMessage::Done);
+                            should_auto_save = true;
                         }
                     }
                     Err(e) => {
@@ -204,12 +254,38 @@ async fn worker_loop(
                 }
             },
             UiMessage::ApproveTools(_tools) => {
-                // Tool approval is handled in chat loop
-                // For now, just send done
-                let _ = tx.send(WorkerMessage::Done);
+                if let Some(pending) = pending_approval.take() {
+                    if let Err(e) = execute_tool_calls_with_events(
+                        &mut agent,
+                        &tx,
+                        &pending.response,
+                        pending.tool_calls,
+                    )
+                    .await
+                    {
+                        let _ = tx.send(WorkerMessage::Error(e.to_string()));
+                    } else {
+                        should_auto_save = true;
+                    }
+                } else {
+                    let _ = tx.send(WorkerMessage::SystemMessage(
+                        "No tools pending approval.".to_string(),
+                    ));
+                }
             }
             UiMessage::DenyTools => {
-                let _ = tx.send(WorkerMessage::Done);
+                if let Some(pending) = pending_approval.take() {
+                    agent.finish_chat_stream(&pending.response);
+                    let _ = tx.send(WorkerMessage::SystemMessage(
+                        "Tool execution skipped.".to_string(),
+                    ));
+                    let _ = tx.send(WorkerMessage::Done);
+                    should_auto_save = true;
+                } else {
+                    let _ = tx.send(WorkerMessage::SystemMessage(
+                        "No tools pending approval.".to_string(),
+                    ));
+                }
             }
             UiMessage::RefreshSessions => {
                 if let Ok(sessions) = list_sessions_for_agent(&agent_id) {

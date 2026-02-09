@@ -860,6 +860,19 @@ impl Agent {
         text_response: &str,
         tool_calls: Vec<ToolCall>,
     ) -> Result<String> {
+        let (final_response, _results) = self
+            .execute_streaming_tool_calls_with_results(text_response, tool_calls)
+            .await?;
+        Ok(final_response)
+    }
+
+    /// Execute tool calls that were accumulated during streaming
+    /// Returns the final response and tool outputs
+    pub async fn execute_streaming_tool_calls_with_results(
+        &mut self,
+        text_response: &str,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<(String, Vec<ToolResult>)> {
         // Add assistant message with tool calls
         self.session.add_message(Message {
             role: Role::Assistant,
@@ -915,7 +928,7 @@ impl Agent {
             images: Vec::new(),
         });
 
-        Ok(final_response)
+        Ok((final_response, results))
     }
 
     /// Get a reference to the LLM provider for streaming
