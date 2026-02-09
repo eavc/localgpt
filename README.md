@@ -76,6 +76,10 @@ active_hours = { start = "09:00", end = "22:00" }
 
 [memory]
 workspace = "~/.localgpt/workspace"
+
+[tools]
+# Additional paths that file tools may access (workspace is always allowed)
+# allowed_paths = ["/tmp/localgpt", "~/projects"]
 ```
 
 ## CLI Commands

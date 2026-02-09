@@ -39,7 +39,7 @@ The following concepts were directly inspired by OpenClaw:
 
 4. **Tool System**
    - Bash execution
-   - File operations (read, write, edit)
+   - File operations (read, write, edit) — sandboxed via `PathSandbox` to workspace and configured `tools.allowed_paths`
    - Memory search and append
 
 ### Key Differences

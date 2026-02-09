@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Security
+
+#### File tools sandboxed to prevent unrestricted filesystem access (SEC-01)
+
+File tools (`read_file`, `write_file`, `edit_file`) now validate all paths
+against a `PathSandbox` before any I/O. Paths are canonicalized to resolve
+symlinks and `..` traversal, then checked against allowed roots (workspace
+directory plus any `tools.allowed_paths` entries from config).
+
+`memory_get` also received defense-in-depth fixes: component-based `..`
+rejection and post-canonicalization containment checks prevent traversal
+via prefixed paths like `memory/../../etc/passwd`.
+
+Configure additional allowed directories in `config.toml`:
+
+```toml
+[tools]
+allowed_paths = ["/tmp/localgpt", "~/projects"]
+```
+
 ### Fixed
 
 #### OpenAI-compatible provider: tool calls silently dropped during streaming
