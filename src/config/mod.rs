@@ -75,6 +75,13 @@ pub struct ToolsConfig {
     /// Wrap tool outputs and memory content with XML-style delimiters
     #[serde(default = "default_true")]
     pub use_content_delimiters: bool,
+
+    /// Additional paths that file tools (read_file, write_file, edit_file) may access.
+    /// The workspace directory is always allowed. Paths here are expanded with tilde
+    /// and canonicalized before use.
+    /// e.g., ["/tmp/localgpt", "~/projects"]
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -329,6 +336,7 @@ impl Default for ToolsConfig {
             tool_output_max_chars: default_tool_output_max_chars(),
             log_injection_warnings: default_true(),
             use_content_delimiters: default_true(),
+            allowed_paths: Vec::new(),
         }
     }
 }
@@ -576,6 +584,13 @@ workspace = "~/.localgpt/workspace"
 # Session memory settings (for /new command)
 # session_max_messages = 15    # Max messages to save (0 = unlimited)
 # session_max_chars = 0        # Max chars per message (0 = unlimited, preserves full content)
+
+[tools]
+# Additional paths that file tools (read_file, write_file, edit_file) may access.
+# The workspace directory is always allowed. Paths are tilde-expanded and
+# canonicalized at startup; entries that do not exist on disk are silently
+# skipped (a warning is logged).
+# allowed_paths = ["/tmp/localgpt", "~/projects"]
 
 [server]
 enabled = true

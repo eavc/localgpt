@@ -1178,7 +1178,7 @@ async fn get_saved_session(Path(session_id): Path<String>) -> Response {
                 };
 
                 // Extract tool calls
-                let tool_calls = msg["toolCalls"].as_array().map(|arr| arr.clone());
+                let tool_calls = msg["toolCalls"].as_array().cloned();
 
                 // Extract tool result ID
                 let tool_call_id = msg["toolCallId"].as_str().map(String::from);
@@ -1265,6 +1265,10 @@ async fn get_daemon_logs(Query(query): Query<LogsQuery>) -> Response {
     };
 
     let reader = BufReader::new(file);
+    // Intentionally using filter_map (not map_while) so that a single non-UTF-8
+    // line or transient I/O error mid-file is skipped rather than truncating
+    // the entire tail of the log.
+    #[allow(clippy::lines_filter_map_ok)]
     let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
     let total_lines = all_lines.len();
 

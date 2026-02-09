@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::providers::ToolSchema;
 use crate::config::Config;
@@ -23,11 +23,142 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, arguments: &str) -> Result<String>;
 }
 
+/// Enforces that file tool operations stay within allowed directory roots.
+///
+/// The workspace directory is always permitted. Additional directories can be
+/// configured via `tools.allowed_paths` in config.
+#[derive(Debug, Clone)]
+pub struct PathSandbox {
+    /// Canonicalized roots that file tools may access.
+    allowed_roots: Vec<PathBuf>,
+    /// Workspace root used to resolve relative paths.
+    workspace_root: PathBuf,
+}
+
+impl PathSandbox {
+    /// Build a sandbox from the workspace path and any extra allowed paths from config.
+    pub fn new(workspace: &Path, extra_allowed: &[String]) -> Self {
+        let mut allowed_roots = Vec::new();
+        let workspace_root = if let Ok(canonical) = fs::canonicalize(workspace) {
+            canonical
+        } else {
+            workspace.to_path_buf()
+        };
+
+        // Workspace is always allowed — canonicalize if it exists, otherwise use as-is
+        allowed_roots.push(workspace_root.clone());
+
+        for raw in extra_allowed {
+            let expanded = shellexpand::tilde(raw);
+            let path = PathBuf::from(expanded.to_string());
+            if let Ok(canonical) = fs::canonicalize(&path) {
+                allowed_roots.push(canonical);
+            } else {
+                warn!(
+                    "tools.allowed_paths entry does not exist, skipping: {}",
+                    raw
+                );
+            }
+        }
+
+        Self {
+            allowed_roots,
+            workspace_root,
+        }
+    }
+
+    /// Validate and expand a user-provided path string.
+    ///
+    /// For **read** operations the target file must already exist so we can
+    /// `canonicalize()` the full path and compare against the allow-list.
+    ///
+    /// For **write** operations the file itself may not exist yet, so we
+    /// canonicalize the nearest existing ancestor and verify *that* falls
+    /// within an allowed root. The returned path is the canonicalized
+    /// ancestor joined with the remaining unresolved components.
+    pub fn validate(&self, raw_path: &str, must_exist: bool) -> Result<PathBuf> {
+        let expanded = shellexpand::tilde(raw_path).to_string();
+        let mut path = PathBuf::from(&expanded);
+        if path.is_relative() {
+            path = self.workspace_root.join(path);
+        }
+
+        if must_exist {
+            // Canonicalize the full path — this resolves symlinks and `..`
+            let canonical = fs::canonicalize(&path)
+                .with_context(|| format!("Cannot resolve path: {}", raw_path))?;
+            self.check_allowed(&canonical, raw_path)?;
+            Ok(canonical)
+        } else {
+            // Walk up until we find an existing ancestor we can canonicalize
+            let (canonical_ancestor, remainder) = self.canonicalize_ancestor(&path)?;
+            self.check_allowed(&canonical_ancestor, raw_path)?;
+            Ok(canonical_ancestor.join(remainder))
+        }
+    }
+
+    /// Check whether a canonicalized path falls under any allowed root.
+    fn check_allowed(&self, canonical: &Path, original: &str) -> Result<()> {
+        for root in &self.allowed_roots {
+            if canonical.starts_with(root) {
+                return Ok(());
+            }
+        }
+        warn!(
+            "Path access denied — outside sandbox: {} (resolved: {})",
+            original,
+            canonical.display()
+        );
+        anyhow::bail!(
+            "Access denied: path '{}' is outside the allowed directories. \
+             File tools may only access the workspace and paths listed in tools.allowed_paths.",
+            original
+        )
+    }
+
+    /// Walk up the path to find the nearest existing ancestor and return
+    /// `(canonicalized_ancestor, remaining_suffix)`.
+    fn canonicalize_ancestor(&self, path: &Path) -> Result<(PathBuf, PathBuf)> {
+        let abs_path = if path.is_relative() {
+            self.workspace_root.join(path)
+        } else {
+            path.to_path_buf()
+        };
+
+        let mut current = abs_path.clone();
+        let mut suffix_parts: Vec<std::ffi::OsString> = Vec::new();
+
+        loop {
+            match fs::canonicalize(&current) {
+                Ok(canonical) => {
+                    let mut remainder = PathBuf::new();
+                    for part in suffix_parts.into_iter().rev() {
+                        remainder.push(part);
+                    }
+                    return Ok((canonical, remainder));
+                }
+                Err(_) => {
+                    if let Some(file_name) = current.file_name() {
+                        suffix_parts.push(file_name.to_os_string());
+                    }
+                    if !current.pop() {
+                        anyhow::bail!(
+                            "Cannot resolve any ancestor of path: {}",
+                            abs_path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn create_default_tools(
     config: &Config,
     memory: Option<Arc<MemoryManager>>,
 ) -> Result<Vec<Box<dyn Tool>>> {
     let workspace = config.workspace_path();
+    let sandbox = Arc::new(PathSandbox::new(&workspace, &config.tools.allowed_paths));
 
     // Use indexed memory search if MemoryManager is provided, otherwise fallback to grep-based
     let memory_search_tool: Box<dyn Tool> = if let Some(ref mem) = memory {
@@ -38,9 +169,9 @@ pub fn create_default_tools(
 
     Ok(vec![
         Box::new(BashTool::new(config.tools.bash_timeout_ms)),
-        Box::new(ReadFileTool::new()),
-        Box::new(WriteFileTool::new()),
-        Box::new(EditFileTool::new()),
+        Box::new(ReadFileTool::new(Arc::clone(&sandbox))),
+        Box::new(WriteFileTool::new(Arc::clone(&sandbox))),
+        Box::new(EditFileTool::new(Arc::clone(&sandbox))),
         memory_search_tool,
         Box::new(MemoryGetTool::new(workspace)),
         Box::new(WebFetchTool::new(config.tools.web_fetch_max_bytes)),
@@ -140,11 +271,13 @@ impl Tool for BashTool {
 }
 
 // Read File Tool
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl ReadFileTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(sandbox: Arc<PathSandbox>) -> Self {
+        Self { sandbox }
     }
 }
 
@@ -157,13 +290,13 @@ impl Tool for ReadFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "read_file".to_string(),
-            description: "Read the contents of a file".to_string(),
+            description: "Read the contents of a file within the workspace".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "The path to the file to read"
+                        "description": "The path to the file to read (must be within workspace)"
                     },
                     "offset": {
                         "type": "integer",
@@ -181,13 +314,13 @@ impl Tool for ReadFileTool {
 
     async fn execute(&self, arguments: &str) -> Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
-        let path = args["path"]
+        let raw_path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing path"))?;
 
-        let path = shellexpand::tilde(path).to_string();
+        let path = self.sandbox.validate(raw_path, true)?;
 
-        debug!("Reading file: {}", path);
+        debug!("Reading file: {}", path.display());
 
         let content = fs::read_to_string(&path)?;
 
@@ -214,11 +347,13 @@ impl Tool for ReadFileTool {
 }
 
 // Write File Tool
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl WriteFileTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(sandbox: Arc<PathSandbox>) -> Self {
+        Self { sandbox }
     }
 }
 
@@ -231,13 +366,14 @@ impl Tool for WriteFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "write_file".to_string(),
-            description: "Write content to a file (creates or overwrites)".to_string(),
+            description: "Write content to a file within the workspace (creates or overwrites)"
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "The path to the file to write"
+                        "description": "The path to the file to write (must be within workspace)"
                     },
                     "content": {
                         "type": "string",
@@ -251,19 +387,19 @@ impl Tool for WriteFileTool {
 
     async fn execute(&self, arguments: &str) -> Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
-        let path = args["path"]
+        let raw_path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing path"))?;
         let content = args["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing content"))?;
 
-        let path = shellexpand::tilde(path).to_string();
-        let path = PathBuf::from(&path);
+        // Validate path — file may not exist yet, so must_exist=false
+        let path = self.sandbox.validate(raw_path, false)?;
 
         debug!("Writing file: {}", path.display());
 
-        // Create parent directories if needed
+        // Create parent directories if needed (only within validated path)
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -279,11 +415,13 @@ impl Tool for WriteFileTool {
 }
 
 // Edit File Tool
-pub struct EditFileTool;
+pub struct EditFileTool {
+    sandbox: Arc<PathSandbox>,
+}
 
 impl EditFileTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(sandbox: Arc<PathSandbox>) -> Self {
+        Self { sandbox }
     }
 }
 
@@ -296,13 +434,14 @@ impl Tool for EditFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "edit_file".to_string(),
-            description: "Edit a file by replacing old_string with new_string".to_string(),
+            description: "Edit a file within the workspace by replacing old_string with new_string"
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "The path to the file to edit"
+                        "description": "The path to the file to edit (must be within workspace)"
                     },
                     "old_string": {
                         "type": "string",
@@ -324,7 +463,7 @@ impl Tool for EditFileTool {
 
     async fn execute(&self, arguments: &str) -> Result<String> {
         let args: Value = serde_json::from_str(arguments)?;
-        let path = args["path"]
+        let raw_path = args["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing path"))?;
         let old_string = args["old_string"]
@@ -335,9 +474,9 @@ impl Tool for EditFileTool {
             .ok_or_else(|| anyhow::anyhow!("Missing new_string"))?;
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
-        let path = shellexpand::tilde(path).to_string();
+        let path = self.sandbox.validate(raw_path, true)?;
 
-        debug!("Editing file: {}", path);
+        debug!("Editing file: {}", path.display());
 
         let content = fs::read_to_string(&path)?;
 
@@ -352,7 +491,11 @@ impl Tool for EditFileTool {
 
         fs::write(&path, &new_content)?;
 
-        Ok(format!("Replaced {} occurrence(s) in {}", count, path))
+        Ok(format!(
+            "Replaced {} occurrence(s) in {}",
+            count,
+            path.display()
+        ))
     }
 }
 
@@ -562,12 +705,56 @@ impl MemoryGetTool {
         Self { workspace }
     }
 
-    fn resolve_path(&self, path: &str) -> PathBuf {
-        // Handle paths relative to workspace
+    fn resolve_path(&self, path: &str) -> Result<PathBuf> {
+        // Only allow workspace-relative memory paths
         if path.starts_with("memory/") || path == "MEMORY.md" || path == "HEARTBEAT.md" {
-            self.workspace.join(path)
+            // Reject paths containing parent-dir components to prevent traversal
+            // (e.g., "memory/../../etc/passwd"). Uses component-based check so
+            // filenames that legitimately contain ".." are not blocked.
+            if Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                warn!("memory_get: path traversal detected via '..': {}", path);
+                anyhow::bail!(
+                    "Access denied: path '{}' contains traversal components",
+                    path
+                );
+            }
+            let joined = self.workspace.join(path);
+            // If the file exists, canonicalize and re-verify as defense-in-depth
+            if joined.exists() {
+                let canonical = fs::canonicalize(&joined)?;
+                let workspace_canonical =
+                    fs::canonicalize(&self.workspace).unwrap_or_else(|_| self.workspace.clone());
+                if !canonical.starts_with(&workspace_canonical) {
+                    warn!(
+                        "memory_get: resolved path outside workspace: {} -> {}",
+                        path,
+                        canonical.display()
+                    );
+                    anyhow::bail!(
+                        "Access denied: path '{}' resolves outside the workspace",
+                        path
+                    );
+                }
+                Ok(canonical)
+            } else {
+                // File doesn't exist yet — return the joined path for the
+                // caller's "File not found" handling
+                Ok(joined)
+            }
         } else {
-            PathBuf::from(shellexpand::tilde(path).to_string())
+            // Reject any path that doesn't match known memory file patterns
+            warn!(
+                "memory_get: rejected path outside workspace memory: {}",
+                path
+            );
+            anyhow::bail!(
+                "Access denied: memory_get only supports workspace memory files \
+                 (MEMORY.md, HEARTBEAT.md, memory/*.md). Got: {}",
+                path
+            )
         }
     }
 }
@@ -581,7 +768,7 @@ impl Tool for MemoryGetTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "memory_get".to_string(),
-            description: "Safe snippet read from MEMORY.md or memory/*.md with optional line range; use after memory_search to pull only the needed lines and keep context small.".to_string(),
+            description: "Safe snippet read from MEMORY.md, HEARTBEAT.md, or memory/*.md with optional line range; use after memory_search to pull only the needed lines and keep context small.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -612,7 +799,7 @@ impl Tool for MemoryGetTool {
         let from = args["from"].as_u64().unwrap_or(1).max(1) as usize;
         let lines_count = args["lines"].as_u64().unwrap_or(50) as usize;
 
-        let resolved_path = self.resolve_path(path);
+        let resolved_path = self.resolve_path(path)?;
 
         debug!(
             "Memory get: {} (from: {}, lines: {})",
@@ -755,5 +942,270 @@ pub fn extract_tool_detail(tool_name: &str, arguments: &str) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn setup_sandbox() -> (TempDir, PathSandbox) {
+        let workspace = TempDir::new().unwrap();
+        let sandbox = PathSandbox::new(workspace.path(), &[]);
+        (workspace, sandbox)
+    }
+
+    fn setup_sandbox_with_extra(extra: &[String]) -> (TempDir, PathSandbox) {
+        let workspace = TempDir::new().unwrap();
+        let sandbox = PathSandbox::new(workspace.path(), extra);
+        (workspace, sandbox)
+    }
+
+    #[test]
+    fn test_sandbox_validate_allows_workspace_file() {
+        let (workspace, sandbox) = setup_sandbox();
+        let file = workspace.path().join("test.md");
+        fs::write(&file, "hello").unwrap();
+
+        let result = sandbox.validate(file.to_str().unwrap(), true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_validate_allows_workspace_subdir() {
+        let (workspace, sandbox) = setup_sandbox();
+        let subdir = workspace.path().join("memory");
+        fs::create_dir_all(&subdir).unwrap();
+        let file = subdir.join("2024-01-01.md");
+        fs::write(&file, "log").unwrap();
+
+        let result = sandbox.validate(file.to_str().unwrap(), true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_validate_denies_outside_workspace() {
+        let (_workspace, sandbox) = setup_sandbox();
+
+        let result = sandbox.validate("/etc/passwd", true);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Access denied"));
+    }
+
+    #[test]
+    fn test_sandbox_validate_denies_traversal_attack() {
+        let (workspace, sandbox) = setup_sandbox();
+        // Create a file in workspace so traversal has something to resolve from
+        let file = workspace.path().join("test.md");
+        fs::write(&file, "hello").unwrap();
+
+        // Try to escape via ../
+        let traversal = format!("{}/../../../etc/passwd", workspace.path().display());
+        let result = sandbox.validate(&traversal, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sandbox_validate_write_new_file_in_workspace() {
+        let (workspace, sandbox) = setup_sandbox();
+        let new_file = workspace.path().join("new_file.md");
+
+        // File doesn't exist yet — must_exist=false
+        let result = sandbox.validate(new_file.to_str().unwrap(), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_validate_write_relative_path_in_workspace() {
+        let (workspace, sandbox) = setup_sandbox();
+
+        let result = sandbox.validate("relative_new.md", false);
+        assert!(result.is_ok());
+        let resolved = result.unwrap();
+        let workspace_canonical =
+            fs::canonicalize(workspace.path()).unwrap_or_else(|_| workspace.path().to_path_buf());
+        assert!(resolved.starts_with(&workspace_canonical));
+    }
+
+    #[test]
+    fn test_sandbox_validate_write_new_file_outside_workspace() {
+        let (_workspace, sandbox) = setup_sandbox();
+        let result = sandbox.validate("/tmp/evil/backdoor.sh", false);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Access denied"));
+    }
+
+    #[test]
+    fn test_sandbox_validate_write_nested_new_dir() {
+        let (workspace, sandbox) = setup_sandbox();
+        let nested = workspace.path().join("a/b/c/new.md");
+
+        let result = sandbox.validate(nested.to_str().unwrap(), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_extra_allowed_path() {
+        let extra_dir = TempDir::new().unwrap();
+        let file = extra_dir.path().join("allowed.txt");
+        fs::write(&file, "ok").unwrap();
+
+        let (_workspace, sandbox) =
+            setup_sandbox_with_extra(&[extra_dir.path().to_str().unwrap().to_string()]);
+
+        let result = sandbox.validate(file.to_str().unwrap(), true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_nonexistent_extra_path_is_skipped() {
+        let (_workspace, sandbox) =
+            setup_sandbox_with_extra(&["/nonexistent/path/12345".to_string()]);
+        // Should only have the workspace root
+        assert_eq!(sandbox.allowed_roots.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_validate_denies_symlink_escape() {
+        let (workspace, sandbox) = setup_sandbox();
+        let target = TempDir::new().unwrap();
+        let secret = target.path().join("secret.txt");
+        fs::write(&secret, "sensitive data").unwrap();
+
+        // Create symlink inside workspace pointing outside
+        let link = workspace.path().join("escape");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+
+        let link_target = link.join("secret.txt");
+        let result = sandbox.validate(link_target.to_str().unwrap(), true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_sandbox_validate_write_denies_traversal() {
+        let (workspace, sandbox) = setup_sandbox();
+        // Test the must_exist=false (write) path with `..` components,
+        // exercising the canonicalize_ancestor codepath
+        let traversal = format!("{}/../../etc/passwd", workspace.path().display());
+        let result = sandbox.validate(&traversal, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_memory_get_resolve_path_allows_memory_files() {
+        let workspace = TempDir::new().unwrap();
+        // Create the files so canonicalize succeeds
+        fs::write(workspace.path().join("MEMORY.md"), "mem").unwrap();
+        fs::write(workspace.path().join("HEARTBEAT.md"), "hb").unwrap();
+        let mem_dir = workspace.path().join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join("2024-01-01.md"), "log").unwrap();
+
+        let tool = MemoryGetTool::new(workspace.path().to_path_buf());
+
+        assert!(tool.resolve_path("MEMORY.md").is_ok());
+        assert!(tool.resolve_path("HEARTBEAT.md").is_ok());
+        assert!(tool.resolve_path("memory/2024-01-01.md").is_ok());
+    }
+
+    #[test]
+    fn test_memory_get_resolve_path_denies_traversal_via_memory_prefix() {
+        let workspace = TempDir::new().unwrap();
+        // Create memory dir so the prefix check passes
+        let mem_dir = workspace.path().join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+
+        let tool = MemoryGetTool::new(workspace.path().to_path_buf());
+
+        // This passes the starts_with("memory/") check but traverses out
+        let result = tool.resolve_path("memory/../../etc/passwd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_memory_get_resolve_path_denies_arbitrary_paths() {
+        let workspace = TempDir::new().unwrap();
+        let tool = MemoryGetTool::new(workspace.path().to_path_buf());
+
+        let result = tool.resolve_path("/etc/passwd");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Access denied"));
+    }
+
+    #[test]
+    fn test_memory_get_resolve_path_denies_home_dir_escape() {
+        let workspace = TempDir::new().unwrap();
+        let tool = MemoryGetTool::new(workspace.path().to_path_buf());
+
+        let result = tool.resolve_path("~/.ssh/id_rsa");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_memory_get_resolve_path_denies_tilde_path() {
+        let workspace = TempDir::new().unwrap();
+        let tool = MemoryGetTool::new(workspace.path().to_path_buf());
+
+        let result = tool.resolve_path("~/../../etc/passwd");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_denies_outside_workspace() {
+        let (_workspace, sandbox) = setup_sandbox();
+        let tool = ReadFileTool::new(Arc::new(sandbox));
+
+        let args = serde_json::json!({"path": "/etc/passwd"}).to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_allows_workspace_file() {
+        let (workspace, sandbox) = setup_sandbox();
+        let file = workspace.path().join("hello.txt");
+        fs::write(&file, "world").unwrap();
+
+        let tool = ReadFileTool::new(Arc::new(sandbox));
+        let args = serde_json::json!({"path": file.to_str().unwrap()}).to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("world"));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_tool_denies_outside_workspace() {
+        let (_workspace, sandbox) = setup_sandbox();
+        let tool = WriteFileTool::new(Arc::new(sandbox));
+
+        let args =
+            serde_json::json!({"path": "/tmp/evil_write_test.txt", "content": "pwned"}).to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_tool_denies_outside_workspace() {
+        let (_workspace, sandbox) = setup_sandbox();
+        let tool = EditFileTool::new(Arc::new(sandbox));
+
+        let args = serde_json::json!({
+            "path": "/etc/hosts",
+            "old_string": "localhost",
+            "new_string": "evil"
+        })
+        .to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
     }
 }

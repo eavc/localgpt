@@ -158,15 +158,13 @@ pub trait LLMProvider: Send + Sync {
         // Default implementation: single chunk with full response
         let resp = self.chat(messages, tools).await?;
         match resp.content {
-            LLMResponseContent::Text(text) => {
-                Ok(Box::pin(futures::stream::once(async move {
-                    Ok(StreamChunk {
-                        delta: text,
-                        done: true,
-                        tool_calls: None,
-                    })
-                })))
-            }
+            LLMResponseContent::Text(text) => Ok(Box::pin(futures::stream::once(async move {
+                Ok(StreamChunk {
+                    delta: text,
+                    done: true,
+                    tool_calls: None,
+                })
+            }))),
             LLMResponseContent::ToolCalls(calls) => {
                 Ok(Box::pin(futures::stream::once(async move {
                     Ok(StreamChunk {
@@ -1809,5 +1807,4 @@ mod tests {
             "custom-model".to_string()
         );
     }
-
 }

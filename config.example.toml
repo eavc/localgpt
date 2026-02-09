@@ -111,6 +111,13 @@ chunk_size = 400
 # Overlap between chunks (tokens)
 chunk_overlap = 80
 
+[tools]
+# Additional paths that file tools (read_file, write_file, edit_file) may access.
+# The workspace directory is always allowed. Paths are tilde-expanded and
+# canonicalized at startup; entries that do not exist on disk are silently
+# skipped (a warning is logged).
+# allowed_paths = ["/tmp/localgpt", "~/projects"]
+
 [server]
 # Enable HTTP server
 enabled = true

@@ -489,16 +489,15 @@ pub fn build_skills_prompt(skills: &[Skill]) -> String {
         return String::new();
     }
 
-    let mut lines = Vec::new();
-    lines.push("## Skills".to_string());
-    lines.push(String::new());
-    lines.push(
+    let mut lines = vec![
+        "## Skills".to_string(),
+        String::new(),
         "Before replying: scan available skills below. If one clearly applies, \
          read its SKILL.md with read_file, then follow it."
             .to_string(),
-    );
-    lines.push(String::new());
-    lines.push("<available_skills>".to_string());
+        String::new(),
+        "<available_skills>".to_string(),
+    ];
 
     for skill in &prompt_skills {
         let emoji_prefix = skill
