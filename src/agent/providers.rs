@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
@@ -273,8 +273,12 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
         "claude-cli" => {
             let cli_config = config.providers.claude_cli.as_ref();
             let command = cli_config.map(|c| c.command.as_str()).unwrap_or("claude");
+            let skip_permissions = cli_config.map(|c| c.skip_permissions).unwrap_or(false);
             Ok(Box::new(ClaudeCliProvider::new(
-                command, &model_id, workspace,
+                command,
+                &model_id,
+                workspace,
+                skip_permissions,
             )?))
         }
 
@@ -301,6 +305,7 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
                     &cli_config.command,
                     &cli_config.model,
                     workspace,
+                    cli_config.skip_permissions,
                 )?));
             }
 
@@ -1124,13 +1129,27 @@ pub struct ClaudeCliProvider {
     localgpt_session_id: String,
     /// CLI session ID for multi-turn conversations (interior mutability for &self methods)
     cli_session_id: StdMutex<Option<String>>,
+    /// Whether to pass `--dangerously-skip-permissions` to the CLI
+    skip_permissions: bool,
 }
 
 /// Provider name for CLI session storage
 const CLAUDE_CLI_PROVIDER: &str = "claude-cli";
 
 impl ClaudeCliProvider {
-    pub fn new(command: &str, model: &str, workspace: std::path::PathBuf) -> Result<Self> {
+    pub fn new(
+        command: &str,
+        model: &str,
+        workspace: std::path::PathBuf,
+        skip_permissions: bool,
+    ) -> Result<Self> {
+        if skip_permissions {
+            warn!(
+                "Claude CLI provider: --dangerously-skip-permissions is enabled. \
+                 The external CLI will bypass its own permission checks."
+            );
+        }
+
         // Load existing CLI session from session store
         let session_key = "main".to_string();
         let existing_session = load_cli_session_from_store(&session_key, CLAUDE_CLI_PROVIDER);
@@ -1146,6 +1165,7 @@ impl ClaudeCliProvider {
             session_key,
             localgpt_session_id: uuid::Uuid::new_v4().to_string(),
             cli_session_id: StdMutex::new(existing_session),
+            skip_permissions,
         })
     }
 
@@ -1263,8 +1283,11 @@ impl ClaudeCliProvider {
             "-p".to_string(),
             "--output-format".to_string(),
             output_format.to_string(),
-            "--dangerously-skip-permissions".to_string(),
         ];
+
+        if self.skip_permissions {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
 
         // Claude CLI requires --verbose when using stream-json with --print
         // Also include partial messages for better visibility into internal process
@@ -1806,5 +1829,91 @@ mod tests {
             resolve_model_alias("custom-model"),
             "custom-model".to_string()
         );
+    }
+
+    #[test]
+    fn test_cli_args_default_no_skip_permissions() {
+        let provider = ClaudeCliProvider {
+            command: "claude".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            session_key: "test".to_string(),
+            localgpt_session_id: "test-id".to_string(),
+            cli_session_id: StdMutex::new(None),
+            skip_permissions: false,
+        };
+
+        let args = provider.build_cli_args("Hello", None, None, true);
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(args.contains(&"-p".to_string()));
+        assert!(args.contains(&"--output-format".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_with_skip_permissions() {
+        let provider = ClaudeCliProvider {
+            command: "claude".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            session_key: "test".to_string(),
+            localgpt_session_id: "test-id".to_string(),
+            cli_session_id: StdMutex::new(None),
+            skip_permissions: true,
+        };
+
+        let args = provider.build_cli_args("Hello", None, None, true);
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_new_session_includes_model() {
+        let provider = ClaudeCliProvider {
+            command: "claude".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            session_key: "test".to_string(),
+            localgpt_session_id: "test-id".to_string(),
+            cli_session_id: StdMutex::new(None),
+            skip_permissions: false,
+        };
+
+        let args = provider.build_cli_args("Hello", None, None, true);
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"claude-3-5-sonnet-20241022".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_resume_session_no_model() {
+        let provider = ClaudeCliProvider {
+            command: "claude".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            session_key: "test".to_string(),
+            localgpt_session_id: "test-id".to_string(),
+            cli_session_id: StdMutex::new(None),
+            skip_permissions: false,
+        };
+
+        let args = provider.build_cli_args("Hello", None, Some("sess-123"), false);
+        assert!(!args.contains(&"--model".to_string()));
+        assert!(args.contains(&"--resume".to_string()));
+        assert!(args.contains(&"sess-123".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_stream_format_includes_verbose() {
+        let provider = ClaudeCliProvider {
+            command: "claude".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            workspace: std::path::PathBuf::from("/tmp"),
+            session_key: "test".to_string(),
+            localgpt_session_id: "test-id".to_string(),
+            cli_session_id: StdMutex::new(None),
+            skip_permissions: false,
+        };
+
+        let args = provider.build_cli_args_with_format("Hello", None, None, true, "stream-json");
+        assert!(args.contains(&"--verbose".to_string()));
+        assert!(args.contains(&"--include-partial-messages".to_string()));
     }
 }

@@ -53,6 +53,12 @@ base_url = "https://api.anthropic.com"
 # [providers.claude_cli]
 # command = "claude"
 # model = "opus"  # opus, sonnet, or haiku
+#
+# WARNING: skip_permissions passes --dangerously-skip-permissions to the
+# Claude CLI subprocess, bypassing its built-in permission system. The CLI
+# will execute file and shell tools without user confirmation. Only enable
+# in trusted, sandboxed environments where you accept the risk.
+# skip_permissions = false
 
 [heartbeat]
 # Enable automatic heartbeat

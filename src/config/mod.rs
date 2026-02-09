@@ -133,6 +133,16 @@ pub struct ClaudeCliConfig {
 
     #[serde(default = "default_claude_cli_model")]
     pub model: String,
+
+    /// Pass `--dangerously-skip-permissions` to the Claude CLI subprocess.
+    /// Default: false.
+    ///
+    /// WARNING: enabling this bypasses the CLI's own permission system,
+    /// allowing the external process to execute file and shell tools
+    /// without user confirmation. Only enable for trusted, sandboxed
+    /// environments where you accept the risk.
+    #[serde(default)]
+    pub skip_permissions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -634,6 +644,9 @@ reserve_tokens = 8000
 # Claude CLI (for claude-cli/* models, requires claude CLI installed)
 [providers.claude_cli]
 command = "claude"
+# WARNING: skip_permissions passes --dangerously-skip-permissions to the CLI,
+# bypassing its permission system. Only enable in trusted/sandboxed environments.
+# skip_permissions = false
 
 [heartbeat]
 enabled = true

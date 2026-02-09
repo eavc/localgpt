@@ -155,6 +155,7 @@ fn convert_openclaw_config(oc: OpenClawConfig) -> Config {
         config.providers.claude_cli = Some(ClaudeCliConfig {
             command: "claude".to_string(),
             model: "opus".to_string(),
+            skip_permissions: false,
         });
     }
 
