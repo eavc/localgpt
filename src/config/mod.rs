@@ -31,6 +31,9 @@ pub struct Config {
 
     #[serde(default)]
     pub tools: ToolsConfig,
+
+    #[serde(default)]
+    pub session: SessionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +272,14 @@ pub struct LoggingConfig {
     /// contain sensitive conversation content.
     #[serde(default)]
     pub log_llm_bodies: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// Days to keep session files (0 = keep forever, no auto-deletion).
+    /// Sessions older than this are automatically purged on startup.
+    #[serde(default)]
+    pub retention_days: u32,
 }
 
 // Default value functions
@@ -566,6 +577,7 @@ impl Config {
             ["memory", "workspace"] => Ok(self.memory.workspace.clone()),
             ["logging", "level"] => Ok(self.logging.level.clone()),
             ["logging", "log_llm_bodies"] => Ok(self.logging.log_llm_bodies.to_string()),
+            ["session", "retention_days"] => Ok(self.session.retention_days.to_string()),
             _ => anyhow::bail!("Unknown config key: {}", key),
         }
     }
@@ -589,6 +601,7 @@ impl Config {
             ["memory", "workspace"] => self.memory.workspace = value.to_string(),
             ["logging", "level"] => self.logging.level = value.to_string(),
             ["logging", "log_llm_bodies"] => self.logging.log_llm_bodies = value.parse()?,
+            ["session", "retention_days"] => self.session.retention_days = value.parse()?,
             _ => anyhow::bail!("Unknown config key: {}", key),
         }
 
@@ -717,6 +730,19 @@ bind = "127.0.0.1"
 # rate_limit_per_minute = 120
 # API key for authenticating HTTP requests (auto-generated if empty)
 # api_key = ""
+
+[session]
+# Days to keep session transcripts (0 = keep forever, no auto-deletion).
+# Sessions older than this are automatically purged on startup.
+# retention_days = 0
+#
+# SECURITY NOTE: Session transcripts are stored as plaintext JSONL files
+# at ~/.localgpt/agents/<id>/sessions/. They contain full conversation
+# history including user prompts, assistant responses, and tool call
+# arguments. Sensitive information discussed in conversations persists
+# on disk until sessions are deleted or expire. Consider setting a
+# retention period if your conversations may contain credentials,
+# personal data, or other sensitive material.
 
 [logging]
 level = "info"

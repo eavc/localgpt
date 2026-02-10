@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::providers::{LLMProvider, Message, Role, ToolCall, Usage};
@@ -845,6 +845,86 @@ pub fn search_sessions_for_agent(agent_id: &str, query: &str) -> Result<Vec<Sess
     Ok(results)
 }
 
+/// Purge session files older than `retention_days` for the given agent.
+///
+/// Returns the number of files deleted. Individual files that cannot be
+/// removed (permissions, I/O errors) are logged and skipped. The function
+/// can fail if the sessions directory cannot be read.
+///
+/// A `retention_days` of 0 is a no-op (keep forever).
+pub fn purge_expired_sessions(agent_id: &str, retention_days: u32) -> Result<u32> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+
+    let sessions_dir = get_sessions_dir_for_agent(agent_id)?;
+    let deleted = purge_expired_sessions_in_dir(&sessions_dir, retention_days)?;
+
+    if deleted > 0 {
+        tracing::info!(
+            "Purged {} expired session(s) for agent '{}' (retention: {} days)",
+            deleted,
+            agent_id,
+            retention_days
+        );
+    }
+
+    Ok(deleted)
+}
+
+/// Core purge logic operating on a specific directory.
+fn purge_expired_sessions_in_dir(sessions_dir: &Path, retention_days: u32) -> Result<u32> {
+    if !sessions_dir.exists() {
+        return Ok(0);
+    }
+
+    let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+    let mut deleted = 0u32;
+
+    for entry in fs::read_dir(sessions_dir)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+
+        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+            continue;
+        }
+
+        // Only purge files with valid UUID filenames — leave other files alone.
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if validate_session_id(stem).is_err() {
+            continue;
+        }
+
+        // Use file modification time (last write) as the session age indicator.
+        let modified = match fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => DateTime::<Utc>::from(t),
+            Err(_) => continue,
+        };
+
+        if modified < cutoff {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    debug!(
+                        "Purged expired session file: {} (modified {})",
+                        path.display(),
+                        modified.format("%Y-%m-%d %H:%M")
+                    );
+                    deleted += 1;
+                }
+                Err(e) => {
+                    warn!("Failed to purge session file {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
+    Ok(deleted)
+}
+
 fn extract_match_preview(content: &str, query_lower: &str, max_len: usize) -> String {
     let content_lower = content.to_lowercase();
 
@@ -972,6 +1052,86 @@ mod tests {
     }
 
     #[test]
+    fn test_purge_expired_sessions_zero_retention_is_noop() {
+        let result = purge_expired_sessions("test-noop", 0).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_purge_expired_sessions_nonexistent_dir_returns_zero() {
+        let result = purge_expired_sessions("nonexistent-agent-id-12345", 30).unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_purge_expired_sessions_deletes_old_files() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir().join(format!("localgpt-test-purge-old-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create an "old" session file and backdate its modification time
+        let old_id = Uuid::new_v4().to_string();
+        let old_file = dir.join(format!("{}.jsonl", old_id));
+        std::fs::write(&old_file, "{}\n").unwrap();
+
+        // Backdate to 60 days ago
+        let sixty_days_ago = SystemTime::now() - Duration::from_secs(60 * 86400);
+        filetime::set_file_mtime(
+            &old_file,
+            filetime::FileTime::from_system_time(sixty_days_ago),
+        )
+        .unwrap();
+
+        // Create a "recent" session file (default mtime = now)
+        let recent_id = Uuid::new_v4().to_string();
+        let recent_file = dir.join(format!("{}.jsonl", recent_id));
+        std::fs::write(&recent_file, "{}\n").unwrap();
+
+        // Create a non-UUID file that should be left alone even if old
+        let other_file = dir.join("notes.jsonl");
+        std::fs::write(&other_file, "keep me\n").unwrap();
+        filetime::set_file_mtime(
+            &other_file,
+            filetime::FileTime::from_system_time(sixty_days_ago),
+        )
+        .unwrap();
+
+        // Call the real purge function with 30-day retention
+        let deleted = purge_expired_sessions_in_dir(&dir, 30).unwrap();
+
+        assert_eq!(deleted, 1, "should delete exactly the old UUID session");
+        assert!(!old_file.exists(), "old session file should be deleted");
+        assert!(recent_file.exists(), "recent session file should remain");
+        assert!(other_file.exists(), "non-UUID file should remain");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_purge_expired_sessions_keeps_recent_files() {
+        let dir = std::env::temp_dir().join(format!("localgpt-test-purge-keep-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create three recent session files
+        for _ in 0..3 {
+            let id = Uuid::new_v4().to_string();
+            let file = dir.join(format!("{}.jsonl", id));
+            std::fs::write(&file, "{}\n").unwrap();
+        }
+
+        // Call the real purge function with 7-day retention — nothing should be deleted
+        let deleted = purge_expired_sessions_in_dir(&dir, 7).unwrap();
+
+        assert_eq!(deleted, 0, "no recent files should be deleted");
+
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count, 3, "all three session files should remain");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_find_session_file_path_in_dir_matches_legacy_uppercase_filename() {
         let dir = std::env::temp_dir().join(format!(
             "localgpt-test-find-legacy-uppercase-{}",
@@ -989,5 +1149,48 @@ mod tests {
         assert_eq!(validate_session_id(resolved_stem).unwrap(), id);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_session_config_defaults_retention_days_zero() {
+        use crate::config::Config;
+        let config = Config::default();
+        assert_eq!(
+            config.session.retention_days, 0,
+            "retention_days must default to 0 (keep forever)"
+        );
+    }
+
+    #[test]
+    fn test_session_config_retention_days_deserializes() {
+        use crate::config::Config;
+        let toml_str = r#"
+[session]
+retention_days = 90
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.session.retention_days, 90);
+    }
+
+    #[test]
+    fn test_session_config_retention_days_omitted_defaults_zero() {
+        use crate::config::Config;
+        let toml_str = r#"
+[logging]
+level = "info"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.session.retention_days, 0);
+    }
+
+    #[test]
+    fn test_session_config_get_set_retention_days() {
+        use crate::config::Config;
+        let mut config = Config::default();
+        assert_eq!(config.get_value("session.retention_days").unwrap(), "0");
+
+        config.set_value("session.retention_days", "45").unwrap();
+        assert_eq!(config.session.retention_days, 45);
+        assert_eq!(config.get_value("session.retention_days").unwrap(), "45");
     }
 }

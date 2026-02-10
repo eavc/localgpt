@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use localgpt::agent::{Agent, AgentConfig};
+use localgpt::agent::{purge_expired_sessions, Agent, AgentConfig};
 use localgpt::concurrency::WorkspaceLock;
 use localgpt::config::Config;
 use localgpt::memory::MemoryManager;
@@ -22,6 +22,12 @@ pub struct AskArgs {
 
 pub async fn run(args: AskArgs, agent_id: &str) -> Result<()> {
     let config = Config::load()?;
+
+    // Purge expired sessions on startup (no-op if retention_days is 0)
+    if let Err(e) = purge_expired_sessions(agent_id, config.session.retention_days) {
+        eprintln!("Warning: could not purge expired sessions: {}", e);
+    }
+
     let memory = MemoryManager::new_with_full_config(&config.memory, Some(&config), agent_id)?;
 
     let agent_config = AgentConfig {

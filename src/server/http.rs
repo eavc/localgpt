@@ -32,8 +32,8 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    extract_tool_detail, find_session_file_path_for_agent, validate_session_id, Agent, AgentConfig,
-    StreamEvent,
+    extract_tool_detail, find_session_file_path_for_agent, purge_expired_sessions,
+    validate_session_id, Agent, AgentConfig, StreamEvent,
 };
 use crate::concurrency::{TurnGate, WorkspaceLock};
 use crate::config::Config;
@@ -224,6 +224,14 @@ impl Server {
             rate_limiter: Mutex::new(RateLimiter::new()),
         });
 
+        // Purge expired session files on startup
+        let retention_days = self.config.session.retention_days;
+        if retention_days > 0 {
+            if let Err(e) = purge_expired_sessions(HTTP_AGENT_ID, retention_days) {
+                info!("Could not purge expired sessions: {}", e);
+            }
+        }
+
         // Load persisted sessions on startup
         if let Err(e) = load_persisted_sessions(&state).await {
             info!("Could not load persisted sessions: {}", e);
@@ -248,6 +256,26 @@ impl Server {
                 save_dirty_sessions(&save_state).await;
             }
         });
+
+        // Spawn periodic session retention purge (daily) for long-running daemons
+        if retention_days > 0 {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(24 * 3600));
+                interval.tick().await; // skip the first immediate tick (startup purge already ran)
+                loop {
+                    interval.tick().await;
+                    let result = tokio::task::spawn_blocking(move || {
+                        purge_expired_sessions(HTTP_AGENT_ID, retention_days)
+                    })
+                    .await;
+                    match result {
+                        Ok(Err(e)) => info!("Periodic session purge failed: {}", e),
+                        Err(e) => info!("Periodic session purge task panicked: {}", e),
+                        _ => {}
+                    }
+                }
+            });
+        }
 
         let port = self.config.server.port;
 

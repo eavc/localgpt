@@ -101,6 +101,7 @@ rustyline = "17.0.2"
 tempfile = "3.14"
 mockall = "0.13"
 tower = { version = "0.5", features = ["util"] }
+filetime = "0.2"
 
 [[bin]]
 name = "localgpt"

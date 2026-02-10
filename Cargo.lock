@@ -2591,6 +2591,7 @@ dependencies = [
  "directories",
  "eframe",
  "fastembed",
+ "filetime",
  "fs2",
  "futures",
  "glob",

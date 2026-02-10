@@ -165,6 +165,19 @@ bind = "127.0.0.1"
 # either a valid Bearer token or a same-origin request from the embedded UI.
 # api_key = ""
 
+[session]
+# Days to keep session transcripts (0 = keep forever, no auto-deletion).
+# Sessions older than this are automatically purged on startup.
+# retention_days = 0
+#
+# SECURITY NOTE: Session transcripts are stored as plaintext JSONL files
+# at ~/.localgpt/agents/<id>/sessions/. They contain full conversation
+# history including user prompts, assistant responses, and tool call
+# arguments. Sensitive information discussed in conversations persists
+# on disk until sessions are deleted or expire. Consider setting a
+# retention period if your conversations may contain credentials,
+# personal data, or other sensitive material.
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

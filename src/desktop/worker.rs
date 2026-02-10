@@ -12,8 +12,8 @@ use anyhow::Result;
 use futures::StreamExt;
 
 use crate::agent::{
-    extract_tool_detail, list_sessions_for_agent, Agent, AgentConfig, ExecutionContext, ToolCall,
-    ToolResult, DEFAULT_AGENT_ID,
+    extract_tool_detail, list_sessions_for_agent, purge_expired_sessions, Agent, AgentConfig,
+    ExecutionContext, ToolCall, ToolResult, DEFAULT_AGENT_ID,
 };
 use crate::config::Config;
 use crate::memory::MemoryManager;
@@ -120,6 +120,12 @@ async fn worker_loop(
 ) -> Result<()> {
     // Initialize agent
     let config = Config::load()?;
+
+    // Purge expired sessions on startup (no-op if retention_days is 0)
+    if let Err(e) = purge_expired_sessions(&agent_id, config.session.retention_days) {
+        eprintln!("Warning: could not purge expired sessions: {}", e);
+    }
+
     let memory = MemoryManager::new_with_full_config(&config.memory, Some(&config), &agent_id)?;
 
     let agent_config = AgentConfig {

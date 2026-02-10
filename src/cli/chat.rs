@@ -7,8 +7,8 @@ use std::io::{self, Write};
 
 use localgpt::agent::{
     extract_tool_detail, get_last_session_id_for_agent, get_skills_summary,
-    list_sessions_for_agent, load_skills, parse_skill_command, search_sessions_for_agent, Agent,
-    AgentConfig, ExecutionContext, ImageAttachment, Skill,
+    list_sessions_for_agent, load_skills, parse_skill_command, purge_expired_sessions,
+    search_sessions_for_agent, Agent, AgentConfig, ExecutionContext, ImageAttachment, Skill,
 };
 use localgpt::concurrency::WorkspaceLock;
 use localgpt::config::Config;
@@ -116,6 +116,12 @@ pub struct ChatArgs {
 
 pub async fn run(args: ChatArgs, agent_id: &str) -> Result<()> {
     let config = Config::load()?;
+
+    // Purge expired sessions on startup (no-op if retention_days is 0)
+    if let Err(e) = purge_expired_sessions(agent_id, config.session.retention_days) {
+        eprintln!("Warning: could not purge expired sessions: {}", e);
+    }
+
     // Embedding provider is automatically created based on config.memory.embedding_provider
     let memory = MemoryManager::new_with_full_config(&config.memory, Some(&config), agent_id)?;
 
