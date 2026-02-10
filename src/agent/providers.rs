@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::Config;
 
@@ -210,6 +210,7 @@ fn normalize_model_id(provider: &str, model_id: &str) -> String {
 
 pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvider>> {
     let workspace = config.workspace_path();
+    let log_llm_bodies = config.logging.log_llm_bodies;
 
     // Resolve aliases first (e.g., "opus" → "anthropic/claude-opus-4-5")
     let model = resolve_model_alias(model);
@@ -250,6 +251,7 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
                 &anthropic_config.base_url,
                 &full_model,
                 config.agent.max_tokens,
+                log_llm_bodies,
             )?))
         }
 
@@ -267,6 +269,7 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
                 &openai_config.api_key,
                 &openai_config.base_url,
                 &model_id,
+                log_llm_bodies,
             )?))
         }
 
@@ -279,6 +282,7 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
                 &model_id,
                 workspace,
                 skip_permissions,
+                log_llm_bodies,
             )?))
         }
 
@@ -295,6 +299,7 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
             Ok(Box::new(OllamaProvider::new(
                 &ollama_config.endpoint,
                 &model_id,
+                log_llm_bodies,
             )?))
         }
 
@@ -306,6 +311,7 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
                     &cli_config.model,
                     workspace,
                     cli_config.skip_permissions,
+                    log_llm_bodies,
                 )?));
             }
 
@@ -330,15 +336,17 @@ pub struct OpenAIProvider {
     api_key: String,
     base_url: String,
     model: String,
+    log_llm_bodies: bool,
 }
 
 impl OpenAIProvider {
-    pub fn new(api_key: &str, base_url: &str, model: &str) -> Result<Self> {
+    pub fn new(api_key: &str, base_url: &str, model: &str, log_llm_bodies: bool) -> Result<Self> {
         Ok(Self {
             client: Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             model: model.to_string(),
+            log_llm_bodies,
         })
     }
 
@@ -445,7 +453,19 @@ impl LLMProvider for OpenAIProvider {
             }
         }
 
-        debug!("OpenAI request: {}", serde_json::to_string_pretty(&body)?);
+        debug!(
+            provider = "openai",
+            model = %self.model,
+            messages = messages.len(),
+            tools = tools.map(|t| t.len()).unwrap_or(0),
+            "OpenAI request"
+        );
+        if self.log_llm_bodies {
+            trace!(
+                "OpenAI request body: {}",
+                serde_json::to_string_pretty(&body)?
+            );
+        }
 
         let response = self
             .client
@@ -458,9 +478,17 @@ impl LLMProvider for OpenAIProvider {
 
         let response_body: Value = response.json().await?;
         debug!(
-            "OpenAI response: {}",
-            serde_json::to_string_pretty(&response_body)?
+            provider = "openai",
+            model = %self.model,
+            has_error = response_body.get("error").is_some(),
+            "OpenAI response"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "OpenAI response body: {}",
+                serde_json::to_string_pretty(&response_body)?
+            );
+        }
 
         // Check for errors
         if let Some(error) = response_body.get("error") {
@@ -537,16 +565,24 @@ pub struct AnthropicProvider {
     base_url: String,
     model: String,
     max_tokens: usize,
+    log_llm_bodies: bool,
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: &str, base_url: &str, model: &str, max_tokens: usize) -> Result<Self> {
+    pub fn new(
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        max_tokens: usize,
+        log_llm_bodies: bool,
+    ) -> Result<Self> {
         Ok(Self {
             client: Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             model: model.to_string(),
             max_tokens,
+            log_llm_bodies,
         })
     }
 
@@ -657,6 +693,8 @@ impl LLMProvider for AnthropicProvider {
         tools: Option<&[ToolSchema]>,
     ) -> Result<LLMResponse> {
         let (system_prompt, formatted_messages) = self.format_messages(messages);
+        let has_system = system_prompt.is_some();
+        let msg_count = formatted_messages.len();
 
         let mut body = json!({
             "model": self.model,
@@ -675,9 +713,19 @@ impl LLMProvider for AnthropicProvider {
         }
 
         debug!(
-            "Anthropic request: {}",
-            serde_json::to_string_pretty(&body)?
+            provider = "anthropic",
+            model = %self.model,
+            messages = msg_count,
+            tools = tools.map(|t| t.len()).unwrap_or(0),
+            has_system,
+            "Anthropic request"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "Anthropic request body: {}",
+                serde_json::to_string_pretty(&body)?
+            );
+        }
 
         let response = self
             .client
@@ -691,9 +739,17 @@ impl LLMProvider for AnthropicProvider {
 
         let response_body: Value = response.json().await?;
         debug!(
-            "Anthropic response: {}",
-            serde_json::to_string_pretty(&response_body)?
+            provider = "anthropic",
+            model = %self.model,
+            has_error = response_body.get("error").is_some(),
+            "Anthropic response"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "Anthropic response body: {}",
+                serde_json::to_string_pretty(&response_body)?
+            );
+        }
 
         // Check for errors
         if let Some(error) = response_body.get("error") {
@@ -766,6 +822,8 @@ impl LLMProvider for AnthropicProvider {
         tools: Option<&[ToolSchema]>,
     ) -> Result<StreamResult> {
         let (system_prompt, formatted_messages) = self.format_messages(messages);
+        let has_system = system_prompt.is_some();
+        let msg_count = formatted_messages.len();
 
         let mut body = json!({
             "model": self.model,
@@ -786,9 +844,20 @@ impl LLMProvider for AnthropicProvider {
         }
 
         debug!(
-            "Anthropic streaming request: {}",
-            serde_json::to_string_pretty(&body)?
+            provider = "anthropic",
+            model = %self.model,
+            messages = msg_count,
+            tools = tools.map(|t| t.len()).unwrap_or(0),
+            has_system,
+            stream = true,
+            "Anthropic streaming request"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "Anthropic streaming request body: {}",
+                serde_json::to_string_pretty(&body)?
+            );
+        }
 
         let response = self
             .client
@@ -934,14 +1003,16 @@ pub struct OllamaProvider {
     client: Client,
     endpoint: String,
     model: String,
+    log_llm_bodies: bool,
 }
 
 impl OllamaProvider {
-    pub fn new(endpoint: &str, model: &str) -> Result<Self> {
+    pub fn new(endpoint: &str, model: &str, log_llm_bodies: bool) -> Result<Self> {
         Ok(Self {
             client: Client::new(),
             endpoint: endpoint.to_string(),
             model: model.to_string(),
+            log_llm_bodies,
         })
     }
 }
@@ -975,7 +1046,19 @@ impl LLMProvider for OllamaProvider {
             "stream": false
         });
 
-        debug!("Ollama request: {}", serde_json::to_string_pretty(&body)?);
+        debug!(
+            provider = "ollama",
+            model = %self.model,
+            messages = messages.len(),
+            tools = 0,
+            "Ollama request"
+        );
+        if self.log_llm_bodies {
+            trace!(
+                "Ollama request body: {}",
+                serde_json::to_string_pretty(&body)?
+            );
+        }
 
         let response = self
             .client
@@ -987,9 +1070,17 @@ impl LLMProvider for OllamaProvider {
 
         let response_body: Value = response.json().await?;
         debug!(
-            "Ollama response: {}",
-            serde_json::to_string_pretty(&response_body)?
+            provider = "ollama",
+            model = %self.model,
+            has_error = response_body.get("error").is_some(),
+            "Ollama response"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "Ollama response body: {}",
+                serde_json::to_string_pretty(&response_body)?
+            );
+        }
 
         let content = response_body["message"]["content"]
             .as_str()
@@ -1057,9 +1148,19 @@ impl LLMProvider for OllamaProvider {
         });
 
         debug!(
-            "Ollama streaming request: {}",
-            serde_json::to_string_pretty(&body)?
+            provider = "ollama",
+            model = %self.model,
+            messages = messages.len(),
+            tools = 0,
+            stream = true,
+            "Ollama streaming request"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "Ollama streaming request body: {}",
+                serde_json::to_string_pretty(&body)?
+            );
+        }
 
         let response = self
             .client
@@ -1131,6 +1232,7 @@ pub struct ClaudeCliProvider {
     cli_session_id: StdMutex<Option<String>>,
     /// Whether to pass `--dangerously-skip-permissions` to the CLI
     skip_permissions: bool,
+    log_llm_bodies: bool,
 }
 
 /// Provider name for CLI session storage
@@ -1142,6 +1244,7 @@ impl ClaudeCliProvider {
         model: &str,
         workspace: std::path::PathBuf,
         skip_permissions: bool,
+        log_llm_bodies: bool,
     ) -> Result<Self> {
         if skip_permissions {
             warn!(
@@ -1166,6 +1269,7 @@ impl ClaudeCliProvider {
             localgpt_session_id: uuid::Uuid::new_v4().to_string(),
             cli_session_id: StdMutex::new(existing_session),
             skip_permissions,
+            log_llm_bodies,
         })
     }
 
@@ -1183,9 +1287,20 @@ impl ClaudeCliProvider {
             let args = self.build_cli_args(prompt, system_prompt, Some(cli_sid), false);
 
             debug!(
-                "Claude CLI (resume): {} {:?} (cwd: {:?})",
-                self.command, args, self.workspace
+                provider = "claude-cli",
+                model = %self.model,
+                mode = "resume",
+                args = args.len(),
+                "Claude CLI request"
             );
+            if self.log_llm_bodies {
+                trace!(
+                    "Claude CLI (resume) args: {} {:?} (cwd: {:?})",
+                    self.command,
+                    args,
+                    self.workspace
+                );
+            }
 
             let output = tokio::task::spawn_blocking({
                 let command = self.command.clone();
@@ -1228,9 +1343,20 @@ impl ClaudeCliProvider {
         let args = self.build_cli_args(prompt, system_prompt, None, true);
 
         debug!(
-            "Claude CLI (new): {} {:?} (cwd: {:?})",
-            self.command, args, self.workspace
+            provider = "claude-cli",
+            model = %self.model,
+            mode = "new",
+            args = args.len(),
+            "Claude CLI request"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "Claude CLI (new) args: {} {:?} (cwd: {:?})",
+                self.command,
+                args,
+                self.workspace
+            );
+        }
 
         let output = tokio::task::spawn_blocking({
             let command = self.command.clone();
@@ -1516,9 +1642,20 @@ impl LLMProvider for ClaudeCliProvider {
         );
 
         debug!(
-            "Claude CLI streaming: {} {:?} (cwd: {:?})",
-            self.command, args, self.workspace
+            provider = "claude-cli",
+            model = %self.model,
+            mode = "stream",
+            args = args.len(),
+            "Claude CLI streaming request"
         );
+        if self.log_llm_bodies {
+            trace!(
+                "Claude CLI streaming args: {} {:?} (cwd: {:?})",
+                self.command,
+                args,
+                self.workspace
+            );
+        }
 
         // Spawn the CLI process with piped stdout
         let mut child = tokio::process::Command::new(&self.command)
@@ -1841,6 +1978,7 @@ mod tests {
             localgpt_session_id: "test-id".to_string(),
             cli_session_id: StdMutex::new(None),
             skip_permissions: false,
+            log_llm_bodies: false,
         };
 
         let args = provider.build_cli_args("Hello", None, None, true);
@@ -1859,6 +1997,7 @@ mod tests {
             localgpt_session_id: "test-id".to_string(),
             cli_session_id: StdMutex::new(None),
             skip_permissions: true,
+            log_llm_bodies: false,
         };
 
         let args = provider.build_cli_args("Hello", None, None, true);
@@ -1875,6 +2014,7 @@ mod tests {
             localgpt_session_id: "test-id".to_string(),
             cli_session_id: StdMutex::new(None),
             skip_permissions: false,
+            log_llm_bodies: false,
         };
 
         let args = provider.build_cli_args("Hello", None, None, true);
@@ -1892,6 +2032,7 @@ mod tests {
             localgpt_session_id: "test-id".to_string(),
             cli_session_id: StdMutex::new(None),
             skip_permissions: false,
+            log_llm_bodies: false,
         };
 
         let args = provider.build_cli_args("Hello", None, Some("sess-123"), false);
@@ -1910,10 +2051,147 @@ mod tests {
             localgpt_session_id: "test-id".to_string(),
             cli_session_id: StdMutex::new(None),
             skip_permissions: false,
+            log_llm_bodies: false,
         };
 
         let args = provider.build_cli_args_with_format("Hello", None, None, true, "stream-json");
         assert!(args.contains(&"--verbose".to_string()));
         assert!(args.contains(&"--include-partial-messages".to_string()));
+    }
+
+    #[test]
+    fn test_logging_config_defaults_log_llm_bodies_false() {
+        let config = Config::default();
+        assert!(
+            !config.logging.log_llm_bodies,
+            "log_llm_bodies must default to false to prevent sensitive data leakage"
+        );
+    }
+
+    #[test]
+    fn test_logging_config_log_llm_bodies_deserializes() {
+        let toml_str = r#"
+[logging]
+level = "debug"
+log_llm_bodies = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.logging.log_llm_bodies);
+    }
+
+    #[test]
+    fn test_logging_config_log_llm_bodies_omitted_defaults_false() {
+        let toml_str = r#"
+[logging]
+level = "info"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.logging.log_llm_bodies);
+    }
+
+    /// Behavioral test: verify that the `log_llm_bodies` flag gates trace-level
+    /// body emission. Uses a tracing subscriber with an in-memory writer to
+    /// capture output and assert on content.
+    #[test]
+    fn test_log_llm_bodies_gate_controls_trace_emission() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::prelude::*;
+
+        // Shared buffer to capture tracing output
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Simulate the gated logging pattern used by all providers.
+        // This directly tests the if-guard logic rather than mocking HTTP calls.
+        fn emit_provider_logs(log_llm_bodies: bool) {
+            let body =
+                serde_json::json!({"messages": [{"role": "user", "content": "SECRET_CONTENT"}]});
+            debug!(
+                provider = "test",
+                model = "test-model",
+                messages = 1,
+                "Test request"
+            );
+            if log_llm_bodies {
+                trace!(
+                    "Test request body: {}",
+                    serde_json::to_string_pretty(&body).unwrap()
+                );
+            }
+        }
+
+        // Test 1: log_llm_bodies=false at TRACE level — body must NOT appear
+        let buf1 = BufWriter(Arc::new(Mutex::new(Vec::new())));
+        let buf1_clone = buf1.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || buf1_clone.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            emit_provider_logs(false);
+        });
+        let output1 = String::from_utf8(buf1.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output1.contains("Test request"),
+            "metadata debug log should appear at TRACE level"
+        );
+        assert!(
+            !output1.contains("SECRET_CONTENT"),
+            "body must NOT appear when log_llm_bodies=false"
+        );
+
+        // Test 2: log_llm_bodies=true at TRACE level — body SHOULD appear
+        let buf2 = BufWriter(Arc::new(Mutex::new(Vec::new())));
+        let buf2_clone = buf2.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || buf2_clone.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            emit_provider_logs(true);
+        });
+        let output2 = String::from_utf8(buf2.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output2.contains("SECRET_CONTENT"),
+            "body SHOULD appear when log_llm_bodies=true at TRACE level"
+        );
+
+        // Test 3: log_llm_bodies=true at DEBUG level — body must NOT appear
+        // (trace! events are filtered out at debug level)
+        let buf3 = BufWriter(Arc::new(Mutex::new(Vec::new())));
+        let buf3_clone = buf3.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || buf3_clone.clone())
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            emit_provider_logs(true);
+        });
+        let output3 = String::from_utf8(buf3.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output3.contains("Test request"),
+            "metadata debug log should appear at DEBUG level"
+        );
+        assert!(
+            !output3.contains("SECRET_CONTENT"),
+            "body must NOT appear at DEBUG level even with log_llm_bodies=true"
+        );
     }
 }

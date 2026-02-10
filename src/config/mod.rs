@@ -262,6 +262,13 @@ pub struct LoggingConfig {
     /// Days to keep log files (0 = keep forever, no auto-deletion)
     #[serde(default)]
     pub retention_days: u32,
+
+    /// Log full LLM request/response bodies at TRACE level.
+    /// Default: false. When false, only structured request/response
+    /// metadata is logged. Enable only for debugging — bodies may
+    /// contain sensitive conversation content.
+    #[serde(default)]
+    pub log_llm_bodies: bool,
 }
 
 // Default value functions
@@ -448,6 +455,7 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             file: default_log_file(),
             retention_days: 0, // 0 = keep forever
+            log_llm_bodies: false,
         }
     }
 }
@@ -557,6 +565,7 @@ impl Config {
             ["server", "api_key"] => Ok(self.server.api_key.clone()),
             ["memory", "workspace"] => Ok(self.memory.workspace.clone()),
             ["logging", "level"] => Ok(self.logging.level.clone()),
+            ["logging", "log_llm_bodies"] => Ok(self.logging.log_llm_bodies.to_string()),
             _ => anyhow::bail!("Unknown config key: {}", key),
         }
     }
@@ -579,6 +588,7 @@ impl Config {
             ["server", "api_key"] => self.server.api_key = value.to_string(),
             ["memory", "workspace"] => self.memory.workspace = value.to_string(),
             ["logging", "level"] => self.logging.level = value.to_string(),
+            ["logging", "log_llm_bodies"] => self.logging.log_llm_bodies = value.parse()?,
             _ => anyhow::bail!("Unknown config key: {}", key),
         }
 
@@ -710,4 +720,8 @@ bind = "127.0.0.1"
 
 [logging]
 level = "info"
+
+# Log full LLM request/response bodies at TRACE level (default: false).
+# WARNING: Bodies may contain sensitive conversation content.
+# log_llm_bodies = false
 "#;

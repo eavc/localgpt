@@ -171,3 +171,9 @@ level = "info"
 
 # Log file path
 file = "~/.localgpt/logs/agent.log"
+
+# Log full LLM request/response bodies at TRACE level (default: false).
+# WARNING: Bodies contain full conversation content which may include
+# sensitive information. Enable only for debugging specific LLM issues.
+# Requires level = "trace" (or RUST_LOG=trace) to take effect.
+# log_llm_bodies = false
