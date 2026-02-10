@@ -16,9 +16,10 @@ pub use sanitize::{
     TOOL_OUTPUT_END, TOOL_OUTPUT_START,
 };
 pub use session::{
-    get_last_session_id, get_last_session_id_for_agent, get_sessions_dir_for_agent, get_state_dir,
-    list_sessions, list_sessions_for_agent, search_sessions, search_sessions_for_agent, Session,
-    SessionInfo, SessionMessage, SessionSearchResult, SessionStatus, DEFAULT_AGENT_ID,
+    find_session_file_path_for_agent, get_last_session_id, get_last_session_id_for_agent,
+    get_sessions_dir_for_agent, get_state_dir, list_sessions, list_sessions_for_agent,
+    search_sessions, search_sessions_for_agent, validate_session_id, Session, SessionInfo,
+    SessionMessage, SessionSearchResult, SessionStatus, DEFAULT_AGENT_ID,
 };
 pub use session_store::{SessionEntry, SessionStore};
 pub use skills::{get_skills_summary, load_skills, parse_skill_command, Skill, SkillInvocation};

@@ -31,7 +31,10 @@ use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info, warn};
 
-use crate::agent::{extract_tool_detail, Agent, AgentConfig, StreamEvent};
+use crate::agent::{
+    extract_tool_detail, find_session_file_path_for_agent, validate_session_id, Agent, AgentConfig,
+    StreamEvent,
+};
 use crate::concurrency::{TurnGate, WorkspaceLock};
 use crate::config::Config;
 use crate::heartbeat::{get_last_heartbeat_event, HeartbeatStatus};
@@ -421,6 +424,16 @@ async fn get_or_create_session(
     state: &Arc<AppState>,
     session_id: Option<String>,
 ) -> Result<String, AppError> {
+    // Validate and normalize user-supplied session ID (must be a valid UUID).
+    // Normalization lowercases the ID so lookups are case-insensitive.
+    let session_id = match session_id {
+        Some(id) => Some(
+            validate_session_id(&id)
+                .map_err(|e| AppError(StatusCode::BAD_REQUEST, e.to_string()))?,
+        ),
+        None => None,
+    };
+
     let mut sessions = state.sessions.lock().await;
 
     // If session_id provided, try to use existing session
@@ -447,7 +460,7 @@ async fn get_or_create_session(
         }
     }
 
-    // Create new session
+    // Create new session (auto-generate UUID if none supplied)
     let new_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let agent_config = AgentConfig {
@@ -1258,22 +1271,24 @@ struct SavedSessionDetail {
 }
 
 async fn get_saved_session(Path(session_id): Path<String>) -> Response {
-    use crate::agent::get_sessions_dir_for_agent;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let sessions_dir = match get_sessions_dir_for_agent(HTTP_AGENT_ID) {
-        Ok(dir) => dir,
+    // Validate and normalize session ID to prevent path traversal
+    let session_id = match validate_session_id(&session_id) {
+        Ok(normalized) => normalized,
+        Err(e) => return AppError(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    let session_path = match find_session_file_path_for_agent(HTTP_AGENT_ID, &session_id) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return AppError(StatusCode::NOT_FOUND, "Session not found".to_string()).into_response()
+        }
         Err(e) => {
             return AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     };
-
-    let session_path = sessions_dir.join(format!("{}.jsonl", session_id));
-
-    if !session_path.exists() {
-        return AppError(StatusCode::NOT_FOUND, "Session not found".to_string()).into_response();
-    }
 
     let file = match File::open(&session_path) {
         Ok(f) => f,
@@ -1687,6 +1702,8 @@ mod tests {
 
         let api_routes = Router::new()
             .route("/api/status", get(|| async { "protected" }))
+            .route("/api/sessions", post(create_session))
+            .route("/api/saved-sessions/{session_id}", get(get_saved_session))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 require_api_key,
@@ -1852,6 +1869,167 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_rejects_path_traversal() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::post("/api/sessions")
+                    .header("Authorization", "Bearer test-key-123")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"session_id":"../../etc/passwd"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_rejects_non_uuid() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::post("/api/sessions")
+                    .header("Authorization", "Bearer test-key-123")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"session_id":"my-custom-name"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_accepts_valid_uuid() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let body = format!(r#"{{"session_id":"{}"}}"#, uuid);
+        let resp = app
+            .oneshot(
+                Request::post("/api/sessions")
+                    .header("Authorization", "Bearer test-key-123")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Passes validation (not 400); may be 500 due to stub Agent setup
+        assert!(
+            resp.status() != StatusCode::BAD_REQUEST && resp.status() != StatusCode::UNAUTHORIZED,
+            "Expected non-validation error, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_session_accepts_no_id() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::post("/api/sessions")
+                    .header("Authorization", "Bearer test-key-123")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Passes validation (not 400); may be 500 due to stub Agent setup
+        assert!(
+            resp.status() != StatusCode::BAD_REQUEST && resp.status() != StatusCode::UNAUTHORIZED,
+            "Expected non-validation error, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_saved_session_rejects_path_traversal() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/saved-sessions/..%2F..%2Fetc%2Fpasswd")
+                    .header("Authorization", "Bearer test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_saved_session_rejects_non_uuid() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/saved-sessions/some-arbitrary-name")
+                    .header("Authorization", "Bearer test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_saved_session_valid_uuid_not_bad_request() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let resp = app
+            .oneshot(
+                Request::get(&format!("/api/saved-sessions/{}", uuid))
+                    .header("Authorization", "Bearer test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Passes validation; will be 404 (session file doesn't exist) not 400
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_saved_session_resolves_legacy_uppercase_filename() {
+        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let lower = uuid::Uuid::new_v4().to_string();
+        let upper = lower.to_uppercase();
+
+        let sessions_dir = crate::agent::get_sessions_dir_for_agent(HTTP_AGENT_ID).unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let legacy_path = sessions_dir.join(format!("{}.jsonl", upper));
+
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 1,
+            "id": upper,
+            "timestamp": "2026-02-10T00:00:00Z",
+            "cwd": "."
+        });
+        std::fs::write(
+            &legacy_path,
+            format!("{}\n", serde_json::to_string(&header).unwrap()),
+        )
+        .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get(&format!("/api/saved-sessions/{}", lower))
+                    .header("Authorization", "Bearer test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        std::fs::remove_file(legacy_path).ok();
     }
 }
 

@@ -4,13 +4,15 @@
 //! - Header: {type: "session", version, id, timestamp, cwd}
 //! - Messages: {type: "message", message: {role, content, ...}}
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tracing::debug;
 use uuid::Uuid;
 
 use super::providers::{LLMProvider, Message, Role, ToolCall, Usage};
@@ -277,25 +279,41 @@ impl Session {
 
     /// Save session in Pi-compatible JSONL format
     pub fn save(&self) -> Result<PathBuf> {
+        validate_session_id(&self.id)?;
         let dir = get_sessions_dir()?;
         fs::create_dir_all(&dir)?;
 
         let path = dir.join(format!("{}.jsonl", self.id));
-        self.save_to_path(&path)?;
+        self.save_to_path(&path, &dir)?;
         Ok(path)
     }
 
     pub fn save_for_agent(&self, agent_id: &str) -> Result<PathBuf> {
+        validate_session_id(&self.id)?;
         let dir = get_sessions_dir_for_agent(agent_id)?;
         fs::create_dir_all(&dir)?;
 
         let path = dir.join(format!("{}.jsonl", self.id));
-        self.save_to_path(&path)?;
+        self.save_to_path(&path, &dir)?;
         Ok(path)
     }
 
-    fn save_to_path(&self, path: &PathBuf) -> Result<()> {
-        let mut file = File::create(path)?;
+    /// Write session data into `parent_dir`.  Only the filename component of
+    /// `path` is used — directory components are discarded (defense-in-depth).
+    fn save_to_path(&self, path: &Path, parent_dir: &Path) -> Result<()> {
+        // Defense-in-depth: construct the write path from the canonical parent
+        // directory and the filename component only.  This guarantees the
+        // target stays inside the sessions directory even if `path` were
+        // somehow manipulated (symlinks, extra components, etc.), and avoids
+        // creating/truncating a file before verifying containment.
+        let canonical_parent = parent_dir.canonicalize().with_context(|| {
+            format!("Cannot canonicalize sessions dir: {}", parent_dir.display())
+        })?;
+        let filename = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Session path has no filename component"))?;
+        let safe_path = canonical_parent.join(filename);
+        let mut file = File::create(&safe_path)?;
 
         // Write Pi-compatible header
         let header = json!({
@@ -413,17 +431,16 @@ impl Session {
 
     /// Load session (supports both old and Pi formats)
     pub fn load(session_id: &str) -> Result<Self> {
+        let normalized = validate_session_id(session_id)?;
         let dir = get_sessions_dir()?;
-        let path = dir.join(format!("{}.jsonl", session_id));
+        let Some(path) = find_session_file_path_in_dir(&dir, &normalized)? else {
+            anyhow::bail!("Session not found: {}", normalized);
+        };
 
-        if !path.exists() {
-            anyhow::bail!("Session not found: {}", session_id);
-        }
-
-        Self::load_from_path(&path, session_id)
+        Self::load_from_path(&path, &normalized)
     }
 
-    fn load_from_path(path: &PathBuf, session_id: &str) -> Result<Self> {
+    fn load_from_path(path: &Path, session_id: &str) -> Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
 
@@ -591,6 +608,17 @@ impl Default for Session {
 /// Default agent ID (matches OpenClaw's default)
 pub const DEFAULT_AGENT_ID: &str = "main";
 
+/// Validate that a session ID is a well-formed UUID and return the canonical
+/// lowercase hyphenated representation.
+///
+/// Rejects path separators, `..`, and any non-UUID input to prevent path
+/// traversal when the ID is used in file-system paths.
+pub fn validate_session_id(id: &str) -> Result<String> {
+    Uuid::parse_str(id)
+        .map(|u| u.to_string()) // canonical lowercase hyphenated form
+        .map_err(|_| anyhow::anyhow!("Invalid session ID: must be a valid UUID"))
+}
+
 fn get_sessions_dir() -> Result<PathBuf> {
     get_sessions_dir_for_agent(DEFAULT_AGENT_ID)
 }
@@ -612,6 +640,54 @@ pub fn get_state_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
     Ok(base.home_dir().join(".localgpt"))
+}
+
+fn find_session_file_path_in_dir(
+    sessions_dir: &Path,
+    normalized_id: &str,
+) -> Result<Option<PathBuf>> {
+    let canonical_path = sessions_dir.join(format!("{}.jsonl", normalized_id));
+    if canonical_path.exists() {
+        return Ok(Some(canonical_path));
+    }
+
+    if !sessions_dir.exists() {
+        return Ok(None);
+    }
+
+    // Backward compatibility for legacy filenames:
+    // find any UUID-parseable stem that normalizes to the same canonical ID.
+    for entry in fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
+            continue;
+        }
+
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+
+        let Ok(candidate) = validate_session_id(stem) else {
+            continue;
+        };
+
+        if candidate == normalized_id {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn find_session_file_path_for_agent(
+    agent_id: &str,
+    session_id: &str,
+) -> Result<Option<PathBuf>> {
+    let normalized = validate_session_id(session_id)?;
+    let sessions_dir = get_sessions_dir_for_agent(agent_id)?;
+    find_session_file_path_in_dir(&sessions_dir, &normalized)
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -638,6 +714,7 @@ pub fn list_sessions_for_agent(agent_id: &str) -> Result<Vec<SessionInfo>> {
     }
 
     let mut sessions = Vec::new();
+    let mut seen_ids = HashSet::new();
 
     for entry in fs::read_dir(&sessions_dir)? {
         let entry = entry?;
@@ -649,7 +726,22 @@ pub fn list_sessions_for_agent(agent_id: &str) -> Result<Vec<SessionInfo>> {
 
         let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
-        if filename.len() < 32 {
+        // Only return sessions with valid UUID filenames.  This ensures
+        // consistency: every listed session can also be opened via
+        // `Session::load` / `get_saved_session` which now require UUIDs.
+        let normalized_id = match validate_session_id(filename) {
+            Ok(id) => id,
+            Err(_) => {
+                debug!("Skipping non-UUID session file: {}", path.display());
+                continue;
+            }
+        };
+
+        if !seen_ids.insert(normalized_id.clone()) {
+            debug!(
+                "Skipping duplicate session ID in listing: {}",
+                normalized_id
+            );
             continue;
         }
 
@@ -673,7 +765,7 @@ pub fn list_sessions_for_agent(agent_id: &str) -> Result<Vec<SessionInfo>> {
                             .unwrap_or(0);
 
                         sessions.push(SessionInfo {
-                            id: filename.to_string(),
+                            id: normalized_id,
                             created_at,
                             message_count,
                             file_size,
@@ -799,5 +891,103 @@ mod tests {
         assert_eq!(msg_usage.input, 100);
         assert_eq!(msg_usage.output, 50);
         assert_eq!(msg_usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn test_validate_session_id_accepts_valid_uuid() {
+        let id = Uuid::new_v4().to_string();
+        let result = validate_session_id(&id).unwrap();
+        assert_eq!(result, id); // already lowercase
+    }
+
+    #[test]
+    fn test_validate_session_id_normalizes_uppercase_to_lowercase() {
+        let result = validate_session_id("A1B2C3D4-E5F6-7890-ABCD-EF1234567890").unwrap();
+        assert_eq!(result, "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+    }
+
+    #[test]
+    fn test_validate_session_id_rejects_path_traversal() {
+        assert!(validate_session_id("../../etc/passwd").is_err());
+        assert!(validate_session_id("../../../tmp/evil").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_rejects_path_separator() {
+        assert!(validate_session_id("foo/bar").is_err());
+        assert!(validate_session_id("foo\\bar").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_rejects_empty() {
+        assert!(validate_session_id("").is_err());
+    }
+
+    #[test]
+    fn test_validate_session_id_rejects_arbitrary_string() {
+        assert!(validate_session_id("not-a-uuid").is_err());
+        assert!(validate_session_id("my-session-name").is_err());
+        assert!(validate_session_id("12345").is_err());
+    }
+
+    #[test]
+    fn test_save_to_path_writes_inside_parent() {
+        let dir = std::env::temp_dir().join(format!("localgpt-test-save-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let session = Session::new();
+        let path = dir.join(format!("{}.jsonl", session.id()));
+        let result = session.save_to_path(&path, &dir);
+        assert!(result.is_ok());
+
+        let canonical_dir = dir.canonicalize().unwrap();
+        let created = canonical_dir.join(format!("{}.jsonl", session.id()));
+        assert!(created.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_save_to_path_discards_traversal_components() {
+        // Even if `path` contains ../ segments, save_to_path only uses the
+        // filename component, so the file ends up inside `parent_dir`.
+        let dir = std::env::temp_dir().join(format!("localgpt-test-traversal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let session = Session::new();
+        let evil_path = dir
+            .join("..")
+            .join("..")
+            .join("tmp")
+            .join(format!("{}.jsonl", session.id()));
+        let result = session.save_to_path(&evil_path, &dir);
+        assert!(result.is_ok());
+
+        // File should be inside `dir`, not in /tmp
+        let canonical_dir = dir.canonicalize().unwrap();
+        let safe_file = canonical_dir.join(format!("{}.jsonl", session.id()));
+        assert!(safe_file.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_find_session_file_path_in_dir_matches_legacy_uppercase_filename() {
+        let dir = std::env::temp_dir().join(format!(
+            "localgpt-test-find-legacy-uppercase-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let legacy_upper = dir.join(format!("{}.jsonl", id.to_uppercase()));
+        std::fs::write(&legacy_upper, "{}\n").unwrap();
+
+        let resolved = find_session_file_path_in_dir(&dir, id).unwrap().unwrap();
+        assert!(resolved.exists());
+        let resolved_stem = resolved.file_stem().and_then(|s| s.to_str()).unwrap();
+        assert_eq!(validate_session_id(resolved_stem).unwrap(), id);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
