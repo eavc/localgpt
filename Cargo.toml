@@ -33,7 +33,7 @@ axum = { version = "0.8", features = ["ws", "macros"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "functions", "vtab", "load_extension"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions", "vtab"] }
 
 # Vector search extension for SQLite
 sqlite-vec = "0.1.7-alpha.2"

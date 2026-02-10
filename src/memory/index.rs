@@ -40,6 +40,10 @@ impl MemoryIndex {
             fs::create_dir_all(parent)?;
         }
 
+        // Register sqlite-vec in-process before opening the connection (SEC-09:
+        // replaces load_extension from filesystem paths with statically-linked init).
+        Self::register_sqlite_vec_auto_extension();
+
         let conn = Connection::open(db_path)?;
 
         // Check if we need to migrate from old schema
@@ -107,8 +111,8 @@ impl MemoryIndex {
         Self::ensure_column(&conn, "files", "source", "TEXT NOT NULL DEFAULT 'memory'")?;
         Self::ensure_column(&conn, "chunks", "source", "TEXT NOT NULL DEFAULT 'memory'")?;
 
-        // Try to load sqlite-vec extension for fast vector search
-        let has_vec_extension = Self::try_load_sqlite_vec(&conn);
+        // Check if sqlite-vec is available (registered via auto-extension above)
+        let has_vec_extension = Self::check_sqlite_vec(&conn);
         if has_vec_extension {
             debug!("sqlite-vec extension loaded successfully");
             Self::ensure_vec_table(&conn)?;
@@ -133,36 +137,48 @@ impl MemoryIndex {
         self
     }
 
-    /// Try to load sqlite-vec extension
+    /// Register sqlite-vec as an auto-extension (called once, process-wide).
+    ///
+    /// Uses the `sqlite-vec` crate's statically-linked `sqlite3_vec_init` entry point
+    /// via `sqlite3_auto_extension`, so no shared libraries are loaded from disk.
+    /// Must be called before `Connection::open` for the extension to be available.
+    /// Once registered, vec0 is permanently available on all future SQLite connections
+    /// in this process.
     #[allow(unsafe_code)]
-    fn try_load_sqlite_vec(conn: &Connection) -> bool {
-        // sqlite-vec provides the extension as a loadable module
-        // Try to load it - this requires the extension to be installed on the system
-
-        // SAFETY: load_extension is unsafe because it loads arbitrary native code
-        // We only load from known, trusted paths (sqlite-vec)
-        if unsafe { conn.load_extension_enable() }.is_err() {
-            return false;
-        }
-
-        // Try loading from common locations
-        let ext_paths = [
-            "vec0", // If in LD_LIBRARY_PATH
-            "./vec0",
-            "/usr/local/lib/vec0",
-            "/usr/lib/vec0",
-        ];
-
-        for path in ext_paths {
-            // SAFETY: Loading sqlite-vec extension from trusted path
-            if unsafe { conn.load_extension(path, None) }.is_ok() {
-                let _ = conn.load_extension_disable();
-                return true;
+    fn register_sqlite_vec_auto_extension() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            // SAFETY: `sqlite3_vec_init` is a valid SQLite auto-extension entry point
+            // provided by the `sqlite-vec` crate (linked at build time). We register it
+            // in-process via `sqlite3_auto_extension` — no external shared libraries are
+            // loaded from disk, eliminating the CWD/LD_LIBRARY_PATH hijack vector.
+            // This follows the upstream sqlite-vec registration pattern (sqlite-vec/src/lib.rs:15).
+            let rc = unsafe {
+                use std::os::raw::{c_char, c_int};
+                type SqliteExtEntryPoint = unsafe extern "C" fn(
+                    *mut rusqlite::ffi::sqlite3,
+                    *mut *mut c_char,
+                    *const rusqlite::ffi::sqlite3_api_routines,
+                ) -> c_int;
+                let init_fn: SqliteExtEntryPoint =
+                    std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+                rusqlite::ffi::sqlite3_auto_extension(Some(init_fn))
+            };
+            if rc != rusqlite::ffi::SQLITE_OK {
+                warn!(
+                    "sqlite3_auto_extension registration failed (rc={}); vector search unavailable",
+                    rc
+                );
             }
-        }
+        });
+    }
 
-        let _ = conn.load_extension_disable();
-        false
+    /// Check whether sqlite-vec is available on this connection.
+    #[must_use]
+    fn check_sqlite_vec(conn: &Connection) -> bool {
+        conn.query_row("SELECT vec_version()", [], |row| row.get::<_, String>(0))
+            .is_ok()
     }
 
     /// Create virtual table for vector search (requires sqlite-vec)
@@ -1063,5 +1079,44 @@ mod tests {
         assert!(!results.is_empty());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_vec_loads_via_auto_extension() {
+        // Verify that sqlite-vec is registered in-process (not via load_extension)
+        MemoryIndex::register_sqlite_vec_auto_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        let version: String = conn
+            .query_row("SELECT vec_version()", [], |row| row.get(0))
+            .expect("vec_version() should be available via auto-extension");
+        assert!(
+            version.starts_with('v'),
+            "expected version string like 'v0.x.y', got: {version}"
+        );
+    }
+
+    #[test]
+    fn test_memory_index_has_vec_extension() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let index = MemoryIndex::new(temp_dir.path())?;
+        // With the statically-linked auto-extension, vec should always be available
+        assert!(
+            index.has_vec_extension(),
+            "sqlite-vec should be available via auto-extension"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_vec_available_without_load_extension_feature() {
+        // SEC-09: Validates that sqlite-vec works via auto-extension without the
+        // rusqlite `load_extension` feature. The feature is removed from Cargo.toml,
+        // so `Connection::load_extension*()` methods no longer exist at compile time —
+        // the entire runtime extension-loading attack surface is eliminated.
+        MemoryIndex::register_sqlite_vec_auto_extension();
+        let conn = Connection::open_in_memory().unwrap();
+
+        // vec0 should work without load_extension being enabled
+        assert!(MemoryIndex::check_sqlite_vec(&conn));
     }
 }
