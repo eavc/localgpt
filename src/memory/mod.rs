@@ -122,6 +122,13 @@ impl MemoryManager {
                 }
             }
             "openai" => {
+                // SEC-13: Warn about external data egress for embeddings
+                warn!(
+                    "DATA EGRESS: OpenAI embedding provider sends ALL indexed memory content \
+                     (MEMORY.md, daily logs, knowledge base) to OpenAI APIs. \
+                     Use embedding_provider = \"local\" for local-only operation."
+                );
+
                 // Need OpenAI config for API key
                 if let Some(config) = app_config {
                     if let Some(ref openai) = config.providers.openai {
@@ -727,5 +734,68 @@ impl MemoryManager {
             .map(|p| p.model().to_string())
             .unwrap_or_default();
         self.index.embedded_chunk_count(&model)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::filter::LevelFilter;
+
+    #[derive(Clone)]
+    struct TracingBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TracingBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` under a scoped tracing subscriber and returns captured output.
+    fn capture_tracing<F: FnOnce()>(level: LevelFilter, f: F) -> String {
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::prelude::*;
+
+        let buf = TracingBuf(Arc::new(Mutex::new(Vec::new())));
+        let buf_clone = buf.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || buf_clone.clone())
+                .with_ansi(false)
+                .with_filter(level),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn test_openai_embedding_provider_emits_data_egress_warning() {
+        // Set up a memory config with openai embedding provider.
+        // The warning fires before API key validation, so no OpenAI config needed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut memory_config = MemoryConfig::default();
+        memory_config.workspace = dir.path().display().to_string();
+        memory_config.embedding_provider = "openai".to_string();
+
+        let output = capture_tracing(LevelFilter::WARN, || {
+            // app_config is None, so the provider creation will fall back to FTS-only,
+            // but the DATA EGRESS warning should fire first.
+            let _ = MemoryManager::new_with_full_config(&memory_config, None, "test");
+        });
+
+        assert!(
+            output.contains("DATA EGRESS"),
+            "Should warn about data egress when OpenAI embedding provider is selected"
+        );
+        assert!(
+            output.contains("ALL indexed memory content"),
+            "Warning should mention that all memory content is sent externally"
+        );
     }
 }

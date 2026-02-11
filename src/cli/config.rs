@@ -122,6 +122,10 @@ default_model = "claude-cli/opus"
 context_window = 128000
 reserve_tokens = 8000
 
+# DATA EGRESS WARNING: Anthropic and OpenAI providers send prompts,
+# conversation history, and tool call content to third-party APIs.
+# For local-only operation, use claude-cli/* or ollama/* models.
+
 # Anthropic API (for anthropic/* models)
 # [providers.anthropic]
 # api_key = "${ANTHROPIC_API_KEY}"

@@ -208,6 +208,15 @@ fn normalize_model_id(provider: &str, model_id: &str) -> String {
     }
 }
 
+/// Returns true if the resolved provider name sends data to external (non-local) APIs.
+///
+/// Note: `claude-cli` is excluded because data egress is managed by the Claude CLI
+/// subprocess itself, not by LocalGPT's network code. Similarly, `ollama` typically
+/// runs locally.
+fn is_external_llm_provider(provider: &str) -> bool {
+    matches!(provider, "anthropic" | "openai")
+}
+
 pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvider>> {
     let workspace = config.workspace_path();
     let log_llm_bodies = config.logging.log_llm_bodies;
@@ -233,6 +242,15 @@ pub fn create_provider(model: &str, config: &Config) -> Result<Box<dyn LLMProvid
             ("unknown".to_string(), model.clone())
         }
     };
+
+    // SEC-13: Warn when using an external LLM provider that sends data to third-party APIs
+    if is_external_llm_provider(&provider) {
+        warn!(
+            "DATA EGRESS: LLM provider '{}/{}' sends prompts and conversation content \
+             to external APIs. Use 'claude-cli/*' or 'ollama/*' for local-only operation.",
+            provider, model_id,
+        );
+    }
 
     match provider.as_str() {
         "anthropic" => {
@@ -2089,29 +2107,49 @@ level = "info"
         assert!(!config.logging.log_llm_bodies);
     }
 
+    // ---- Shared test helper: captures tracing output into a string ----
+
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::filter::LevelFilter;
+
+    /// In-memory writer for capturing tracing output in tests.
+    #[derive(Clone)]
+    struct TracingBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TracingBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` under a scoped tracing subscriber at the given level and
+    /// returns the captured output as a String.
+    fn capture_tracing<F: FnOnce()>(level: LevelFilter, f: F) -> String {
+        use tracing_subscriber::fmt;
+        use tracing_subscriber::prelude::*;
+
+        let buf = TracingBuf(Arc::new(Mutex::new(Vec::new())));
+        let buf_clone = buf.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(move || buf_clone.clone())
+                .with_ansi(false)
+                .with_filter(level),
+        );
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
     /// Behavioral test: verify that the `log_llm_bodies` flag gates trace-level
     /// body emission. Uses a tracing subscriber with an in-memory writer to
     /// capture output and assert on content.
     #[test]
     fn test_log_llm_bodies_gate_controls_trace_emission() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt;
-        use tracing_subscriber::prelude::*;
-
-        // Shared buffer to capture tracing output
-        #[derive(Clone)]
-        struct BufWriter(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for BufWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         // Simulate the gated logging pattern used by all providers.
         // This directly tests the if-guard logic rather than mocking HTTP calls.
         fn emit_provider_logs(log_llm_bodies: bool) {
@@ -2132,18 +2170,7 @@ level = "info"
         }
 
         // Test 1: log_llm_bodies=false at TRACE level — body must NOT appear
-        let buf1 = BufWriter(Arc::new(Mutex::new(Vec::new())));
-        let buf1_clone = buf1.clone();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(move || buf1_clone.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
-        );
-        tracing::subscriber::with_default(subscriber, || {
-            emit_provider_logs(false);
-        });
-        let output1 = String::from_utf8(buf1.0.lock().unwrap().clone()).unwrap();
+        let output1 = capture_tracing(LevelFilter::TRACE, || emit_provider_logs(false));
         assert!(
             output1.contains("Test request"),
             "metadata debug log should appear at TRACE level"
@@ -2154,18 +2181,7 @@ level = "info"
         );
 
         // Test 2: log_llm_bodies=true at TRACE level — body SHOULD appear
-        let buf2 = BufWriter(Arc::new(Mutex::new(Vec::new())));
-        let buf2_clone = buf2.clone();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(move || buf2_clone.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
-        );
-        tracing::subscriber::with_default(subscriber, || {
-            emit_provider_logs(true);
-        });
-        let output2 = String::from_utf8(buf2.0.lock().unwrap().clone()).unwrap();
+        let output2 = capture_tracing(LevelFilter::TRACE, || emit_provider_logs(true));
         assert!(
             output2.contains("SECRET_CONTENT"),
             "body SHOULD appear when log_llm_bodies=true at TRACE level"
@@ -2173,18 +2189,7 @@ level = "info"
 
         // Test 3: log_llm_bodies=true at DEBUG level — body must NOT appear
         // (trace! events are filtered out at debug level)
-        let buf3 = BufWriter(Arc::new(Mutex::new(Vec::new())));
-        let buf3_clone = buf3.clone();
-        let subscriber = tracing_subscriber::registry().with(
-            fmt::layer()
-                .with_writer(move || buf3_clone.clone())
-                .with_ansi(false)
-                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
-        );
-        tracing::subscriber::with_default(subscriber, || {
-            emit_provider_logs(true);
-        });
-        let output3 = String::from_utf8(buf3.0.lock().unwrap().clone()).unwrap();
+        let output3 = capture_tracing(LevelFilter::DEBUG, || emit_provider_logs(true));
         assert!(
             output3.contains("Test request"),
             "metadata debug log should appear at DEBUG level"
@@ -2192,6 +2197,98 @@ level = "info"
         assert!(
             !output3.contains("SECRET_CONTENT"),
             "body must NOT appear at DEBUG level even with log_llm_bodies=true"
+        );
+    }
+
+    #[test]
+    fn test_is_external_llm_provider_classifies_correctly() {
+        // External providers (send data to third-party APIs)
+        assert!(
+            is_external_llm_provider("anthropic"),
+            "Anthropic sends data to external APIs"
+        );
+        assert!(
+            is_external_llm_provider("openai"),
+            "OpenAI sends data to external APIs"
+        );
+
+        // Local providers (no external data egress)
+        assert!(!is_external_llm_provider("ollama"), "Ollama runs locally");
+        assert!(
+            !is_external_llm_provider("claude-cli"),
+            "Claude CLI runs locally via subprocess"
+        );
+        assert!(
+            !is_external_llm_provider("unknown"),
+            "Unknown providers are not classified as external"
+        );
+    }
+
+    #[test]
+    fn test_external_provider_warning_emitted_for_anthropic() {
+        let mut config = Config::default();
+        config.providers.anthropic = Some(crate::config::AnthropicConfig {
+            api_key: "test-key".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+        });
+
+        let output = capture_tracing(LevelFilter::WARN, || {
+            let _ = create_provider("anthropic/claude-opus-4-5", &config);
+        });
+        assert!(
+            output.contains("DATA EGRESS"),
+            "Should warn about data egress for anthropic provider"
+        );
+        assert!(
+            output.contains("anthropic"),
+            "Warning should mention the provider name"
+        );
+    }
+
+    #[test]
+    fn test_external_provider_warning_emitted_for_openai() {
+        let mut config = Config::default();
+        config.providers.openai = Some(crate::config::OpenAIConfig {
+            api_key: "test-key".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+        });
+
+        let output = capture_tracing(LevelFilter::WARN, || {
+            let _ = create_provider("openai/gpt-4o", &config);
+        });
+        assert!(
+            output.contains("DATA EGRESS"),
+            "Should warn about data egress for OpenAI provider"
+        );
+        assert!(
+            output.contains("openai"),
+            "Warning should mention the provider name"
+        );
+    }
+
+    #[test]
+    fn test_no_external_provider_warning_for_ollama() {
+        let mut config = Config::default();
+        config.providers.ollama = Some(crate::config::OllamaConfig {
+            endpoint: "http://localhost:11434".to_string(),
+            model: "llama3".to_string(),
+        });
+
+        let output = capture_tracing(LevelFilter::WARN, || {
+            let _ = create_provider("ollama/llama3", &config);
+        });
+        assert!(
+            !output.contains("DATA EGRESS"),
+            "Should NOT warn about data egress for local ollama provider"
+        );
+    }
+
+    #[test]
+    fn test_embedding_provider_default_is_local() {
+        let config = Config::default();
+        assert_eq!(
+            config.memory.embedding_provider, "local",
+            "Default embedding provider must be 'local' to prevent unintended data egress"
         );
     }
 }

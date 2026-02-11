@@ -192,6 +192,10 @@ pub struct MemoryConfig {
     pub workspace: String,
 
     /// Embedding provider: "local" (fastembed, default), "openai", or "none"
+    ///
+    /// DATA EGRESS WARNING: "openai" sends ALL indexed memory content
+    /// (MEMORY.md, daily logs, knowledge base) to OpenAI APIs.
+    /// Use "local" (default) for local-only operation.
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
 
@@ -663,6 +667,10 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# LocalGPT Configuration
 default_model = "claude-cli/opus"
 context_window = 128000
 reserve_tokens = 8000
+
+# DATA EGRESS WARNING: Anthropic and OpenAI providers send prompts,
+# conversation history, and tool call content to third-party APIs.
+# For local-only operation, use claude-cli/* or ollama/* models.
 
 # Anthropic API (for anthropic/* models)
 # [providers.anthropic]

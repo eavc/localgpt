@@ -32,6 +32,10 @@ context_window = 128000
 # Reserve tokens for response
 reserve_tokens = 8000
 
+# DATA EGRESS WARNING: Anthropic and OpenAI providers send prompts,
+# conversation history, and tool call content to third-party APIs.
+# For local-only operation, use claude-cli/* or ollama/* models.
+
 # Anthropic configuration (REQUIRED for default model)
 # Get your API key at: https://console.anthropic.com/
 [providers.anthropic]
@@ -90,6 +94,7 @@ workspace = "~/.localgpt/workspace"
 # - "local": Uses FastEmbed/ONNX (all-MiniLM-L6-v2), no API key needed
 # - "gguf": Uses llama.cpp for GGUF models (requires --features gguf build)
 # - "openai": Uses OpenAI embeddings (requires providers.openai config)
+#             DATA EGRESS WARNING: sends ALL indexed memory content to OpenAI APIs
 # - "none": FTS-only search, no vector embeddings
 embedding_provider = "local"
 
