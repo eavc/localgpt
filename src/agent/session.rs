@@ -858,7 +858,7 @@ pub fn purge_expired_sessions(agent_id: &str, retention_days: u32) -> Result<u32
     }
 
     let sessions_dir = get_sessions_dir_for_agent(agent_id)?;
-    let deleted = purge_expired_sessions_in_dir(&sessions_dir, retention_days)?;
+    let deleted = purge_and_prune_in_dir(&sessions_dir, retention_days)?;
 
     if deleted > 0 {
         tracing::info!(
@@ -867,6 +867,33 @@ pub fn purge_expired_sessions(agent_id: &str, retention_days: u32) -> Result<u32
             agent_id,
             retention_days
         );
+    }
+
+    Ok(deleted)
+}
+
+/// Core purge+prune: delete expired `.jsonl` files, then remove stale
+/// `sessions.json` entries. Returns the number of deleted session files.
+///
+/// Always attempts to prune stale store entries — not just when files were
+/// deleted in this run. A prior crash between file deletion and store
+/// pruning could leave orphaned entries that only this unconditional path
+/// cleans up.
+fn purge_and_prune_in_dir(sessions_dir: &Path, retention_days: u32) -> Result<u32> {
+    let deleted = purge_expired_sessions_in_dir(sessions_dir, retention_days)?;
+
+    let store_path = sessions_dir.join("sessions.json");
+    if store_path.exists() {
+        match super::session_store::SessionStore::load_from_path(&store_path) {
+            Ok(mut store) => {
+                if let Err(e) = store.prune_stale_entries() {
+                    warn!("Failed to prune stale session store entries: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load session store for pruning: {}", e);
+            }
+        }
     }
 
     Ok(deleted)
@@ -1192,5 +1219,57 @@ level = "info"
         config.set_value("session.retention_days", "45").unwrap();
         assert_eq!(config.session.retention_days, 45);
         assert_eq!(config.get_value("session.retention_days").unwrap(), "45");
+    }
+
+    #[test]
+    fn test_purge_and_prune_integration() {
+        use crate::agent::session_store::SessionStore;
+        use std::collections::HashMap;
+        use std::time::{Duration, SystemTime};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Create two session files: one old (will be purged), one recent (kept)
+        let old_id = Uuid::new_v4().to_string();
+        let recent_id = Uuid::new_v4().to_string();
+
+        let old_file = dir.join(format!("{}.jsonl", old_id));
+        let recent_file = dir.join(format!("{}.jsonl", recent_id));
+        std::fs::write(&old_file, "{}\n").unwrap();
+        std::fs::write(&recent_file, "{}\n").unwrap();
+
+        // Backdate old file to 60 days ago
+        let sixty_days_ago = SystemTime::now() - Duration::from_secs(60 * 86400);
+        filetime::set_file_mtime(
+            &old_file,
+            filetime::FileTime::from_system_time(sixty_days_ago),
+        )
+        .unwrap();
+
+        // Create a session store with entries for both sessions
+        let store_path = dir.join("sessions.json");
+        let mut store = SessionStore::new_at(store_path.clone());
+        store.get_or_create("old_session", &old_id);
+        store.get_or_create("recent_session", &recent_id);
+        store.save().unwrap();
+        assert_eq!(store.entries().len(), 2);
+
+        // Call the production purge+prune path (30-day retention)
+        let deleted = purge_and_prune_in_dir(dir, 30).unwrap();
+        assert_eq!(deleted, 1, "should delete exactly the old session file");
+        assert!(!old_file.exists(), "old session file should be deleted");
+        assert!(recent_file.exists(), "recent session file should remain");
+
+        // Verify on-disk sessions.json was pruned by the production code path
+        let content = std::fs::read_to_string(&store_path).unwrap();
+        let parsed: HashMap<String, crate::agent::session_store::SessionEntry> =
+            serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1, "stale entry should be pruned from disk");
+        assert!(parsed.contains_key("recent_session"));
+        assert!(
+            !parsed.contains_key("old_session"),
+            "old_session entry should be gone"
+        );
     }
 }

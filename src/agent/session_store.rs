@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use super::session::{get_sessions_dir_for_agent, DEFAULT_AGENT_ID};
@@ -125,13 +125,32 @@ impl SessionEntry {
     }
 }
 
-/// Session store - manages the sessions.json file
+/// Session store - manages the sessions.json file.
+///
+/// `path` points to `<sessions_dir>/sessions.json`. The parent directory
+/// is assumed to contain the `.jsonl` session files — this invariant is
+/// relied upon by [`prune_stale_entries`](Self::prune_stale_entries).
 pub struct SessionStore {
     path: PathBuf,
     entries: HashMap<String, SessionEntry>,
 }
 
 impl SessionStore {
+    /// Create a session store at a specific path (for testing).
+    #[cfg(test)]
+    pub(crate) fn new_at(path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Read-only access to entries (for testing/inspection).
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &HashMap<String, SessionEntry> {
+        &self.entries
+    }
+
     /// Load session store for the default agent
     pub fn load() -> Result<Self> {
         Self::load_for_agent(DEFAULT_AGENT_ID)
@@ -141,9 +160,13 @@ impl SessionStore {
     pub fn load_for_agent(agent_id: &str) -> Result<Self> {
         let sessions_dir = get_sessions_dir_for_agent(agent_id)?;
         let path = sessions_dir.join("sessions.json");
+        Self::load_from_path(&path)
+    }
 
+    /// Load session store from an explicit path.
+    pub(super) fn load_from_path(path: &Path) -> Result<Self> {
         let entries = if path.exists() {
-            let content = fs::read_to_string(&path)?;
+            let content = fs::read_to_string(path)?;
             serde_json::from_str(&content).unwrap_or_default()
         } else {
             HashMap::new()
@@ -155,7 +178,10 @@ impl SessionStore {
             entries.len()
         );
 
-        Ok(Self { path, entries })
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+        })
     }
 
     /// Save session store to disk using atomic write (temp file + rename).
@@ -242,6 +268,34 @@ impl SessionStore {
         self.update(session_key, session_id, |entry| {
             entry.set_cli_session_id(provider, cli_session_id);
         })
+    }
+
+    /// Remove entries whose `.jsonl` session files no longer exist on disk.
+    ///
+    /// Returns the number of pruned entries. Saves to disk only if entries
+    /// were actually removed. Uses `try_exists()` so that transient I/O
+    /// errors keep entries (fail-safe against accidental data loss).
+    pub fn prune_stale_entries(&mut self) -> Result<u32> {
+        let sessions_dir = match self.path.parent() {
+            Some(dir) => dir,
+            None => return Ok(0),
+        };
+
+        let before = self.entries.len();
+        self.entries.retain(|_key, entry| {
+            let file = sessions_dir.join(format!("{}.jsonl", entry.session_id));
+            // Keep the entry unless we are *certain* the file is gone.
+            // try_exists() returns Err on permission/IO failures — keep those.
+            file.try_exists().unwrap_or(true)
+        });
+
+        let pruned = (before - self.entries.len()) as u32;
+        if pruned > 0 {
+            self.save()?;
+            debug!("Pruned {} stale session store entries", pruned);
+        }
+
+        Ok(pruned)
     }
 }
 
@@ -359,5 +413,86 @@ mod tests {
         assert_eq!(main.session_id, "session-abc");
         assert_eq!(main.input_tokens, Some(1000));
         assert_eq!(main.output_tokens, Some(500));
+    }
+
+    #[test]
+    fn test_prune_stale_entries_removes_entries_without_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.json");
+
+        let live_id = uuid::Uuid::new_v4().to_string();
+        let stale_id = uuid::Uuid::new_v4().to_string();
+
+        // Create a .jsonl file only for the "live" session
+        fs::write(tmp.path().join(format!("{}.jsonl", live_id)), "{}\n").unwrap();
+
+        let mut store = SessionStore {
+            path: path.clone(),
+            entries: HashMap::new(),
+        };
+        store.get_or_create("live", &live_id);
+        store.get_or_create("stale", &stale_id);
+        store.save().unwrap();
+
+        assert_eq!(store.entries.len(), 2);
+
+        let pruned = store.prune_stale_entries().unwrap();
+        assert_eq!(pruned, 1, "should prune exactly the stale entry");
+        assert!(store.get("live").is_some(), "live entry should remain");
+        assert!(store.get("stale").is_none(), "stale entry should be gone");
+
+        // Verify the file on disk reflects the pruning
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: HashMap<String, SessionEntry> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains_key("live"));
+    }
+
+    #[test]
+    fn test_prune_stale_entries_noop_when_all_files_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.json");
+
+        let id1 = uuid::Uuid::new_v4().to_string();
+        let id2 = uuid::Uuid::new_v4().to_string();
+
+        // Create .jsonl files for both sessions
+        fs::write(tmp.path().join(format!("{}.jsonl", id1)), "{}\n").unwrap();
+        fs::write(tmp.path().join(format!("{}.jsonl", id2)), "{}\n").unwrap();
+
+        let mut store = SessionStore {
+            path: path.clone(),
+            entries: HashMap::new(),
+        };
+        store.get_or_create("s1", &id1);
+        store.get_or_create("s2", &id2);
+        store.save().unwrap();
+
+        let pruned = store.prune_stale_entries().unwrap();
+        assert_eq!(pruned, 0, "nothing to prune");
+        assert_eq!(store.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_prune_stale_entries_removes_all_when_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.json");
+
+        let mut store = SessionStore {
+            path: path.clone(),
+            entries: HashMap::new(),
+        };
+        store.get_or_create("a", &uuid::Uuid::new_v4().to_string());
+        store.get_or_create("b", &uuid::Uuid::new_v4().to_string());
+        store.save().unwrap();
+
+        let pruned = store.prune_stale_entries().unwrap();
+        assert_eq!(pruned, 2, "should prune all entries");
+        assert!(store.entries.is_empty());
+
+        // Verify on-disk file is empty map
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: HashMap<String, SessionEntry> = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_empty());
     }
 }
