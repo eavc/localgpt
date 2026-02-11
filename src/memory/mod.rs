@@ -202,20 +202,27 @@ impl MemoryManager {
     }
 
     /// Create a minimal MemoryManager for testing (uses temp directory, no embeddings).
+    /// Returns `(TempDir, Self)` — caller must hold the `TempDir` handle so the
+    /// directory is cleaned up when the test finishes (even on panic).
+    /// `TempDir` is first so that in `let (_tmpdir, memory) = ...` destructuring,
+    /// `memory` (and its SQLite handles) drops before `_tmpdir` removes the directory.
     #[cfg(test)]
-    pub fn new_stub() -> Self {
-        let dir = std::env::temp_dir().join(format!("localgpt-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+    pub fn new_stub() -> (tempfile::TempDir, Self) {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dir = tmp.path().to_path_buf();
         let db_path = dir.join("test.sqlite");
         let index = MemoryIndex::new_with_db_path(&dir, &db_path).expect("create test index");
-        Self {
-            workspace: dir,
-            db_path,
-            index,
-            config: MemoryConfig::default(),
-            embedding_provider: None,
-            is_brand_new: true,
-        }
+        (
+            tmp,
+            Self {
+                workspace: dir,
+                db_path,
+                index,
+                config: MemoryConfig::default(),
+                embedding_provider: None,
+                is_brand_new: true,
+            },
+        )
     }
 
     /// Set embedding provider for semantic search (requires OpenAI API key)

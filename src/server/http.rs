@@ -1714,14 +1714,21 @@ mod tests {
     use tower::ServiceExt;
 
     /// Build a minimal test app with auth middleware and a test API endpoint.
-    fn test_app(api_key: &str, bind: &str, rate_limit_per_minute: u32) -> Router {
+    /// Returns `(TempDir, Router)` — caller must hold the `TempDir` handle so the
+    /// MemoryManager's temp workspace is cleaned up when the test finishes.
+    fn test_app(
+        api_key: &str,
+        bind: &str,
+        rate_limit_per_minute: u32,
+    ) -> (tempfile::TempDir, Router) {
         let mut config = Config::default();
         config.server.bind = bind.to_string();
         config.server.rate_limit_per_minute = rate_limit_per_minute;
+        let (tmpdir, memory) = MemoryManager::new_stub();
         let state = Arc::new(AppState {
             config,
             sessions: Mutex::new(HashMap::new()),
-            memory: MemoryManager::new_stub(),
+            memory,
             turn_gate: TurnGate::new(),
             workspace_lock: WorkspaceLock::new().unwrap(),
             api_key: api_key.to_string(),
@@ -1743,12 +1750,12 @@ mod tests {
 
         let public_routes = Router::new().route("/health", get(|| async { "ok" }));
 
-        public_routes.merge(api_routes).with_state(state)
+        (tmpdir, public_routes.merge(api_routes).with_state(state))
     }
 
     #[tokio::test]
     async fn test_health_no_auth_required() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
@@ -1758,7 +1765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_requires_auth() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
             .await
@@ -1768,7 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_wrong_key_rejected() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1783,7 +1790,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_correct_bearer_accepted() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1798,7 +1805,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_query_param_accepted() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status?api_key=test-key-123")
@@ -1812,7 +1819,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_origin_bypasses_auth() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1827,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sec_fetch_none_requires_auth() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1842,7 +1849,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_site_requires_auth() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1857,7 +1864,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_same_origin_bypass_rejected_on_non_loopback() {
-        let app = test_app("test-key-123", "0.0.0.0", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "0.0.0.0", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1872,7 +1879,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limit_enforced() {
-        let app = test_app("test-key-123", "127.0.0.1", 2);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 2);
         for _ in 0..2 {
             let resp = app
                 .clone()
@@ -1901,7 +1908,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_rejects_path_traversal() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::post("/api/sessions")
@@ -1917,7 +1924,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_rejects_non_uuid() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::post("/api/sessions")
@@ -1933,7 +1940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_accepts_valid_uuid() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let uuid = uuid::Uuid::new_v4().to_string();
         let body = format!(r#"{{"session_id":"{}"}}"#, uuid);
         let resp = app
@@ -1956,7 +1963,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_accepts_no_id() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::post("/api/sessions")
@@ -1977,7 +1984,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_rejects_path_traversal() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/saved-sessions/..%2F..%2Fetc%2Fpasswd")
@@ -1992,7 +1999,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_rejects_non_uuid() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/saved-sessions/some-arbitrary-name")
@@ -2007,7 +2014,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_valid_uuid_not_bad_request() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let uuid = uuid::Uuid::new_v4().to_string();
         let resp = app
             .oneshot(
@@ -2024,7 +2031,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_resolves_legacy_uppercase_filename() {
-        let app = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let lower = uuid::Uuid::new_v4().to_string();
         let upper = lower.to_uppercase();
 
