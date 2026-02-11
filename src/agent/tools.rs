@@ -37,9 +37,58 @@ pub struct PathSandbox {
     allowed_roots: Vec<PathBuf>,
     /// Workspace root used to resolve relative paths.
     workspace_root: PathBuf,
+    /// Human-readable description of what this sandbox allows (used in error messages).
+    scope_description: String,
 }
 
 impl PathSandbox {
+    /// Build a restricted sandbox for heartbeat operation.
+    ///
+    /// Only allows access to `HEARTBEAT.md`, `MEMORY.md`, and the `memory/`
+    /// subdirectory within the workspace. This limits the blast radius of
+    /// prompt injection via HEARTBEAT.md content — a compromised heartbeat
+    /// agent cannot read or write arbitrary workspace files.
+    pub fn new_heartbeat(workspace: &Path) -> Self {
+        let workspace_root = if let Ok(canonical) = fs::canonicalize(workspace) {
+            canonical
+        } else {
+            workspace.to_path_buf()
+        };
+
+        let narrow_paths = ["HEARTBEAT.md", "MEMORY.md", "memory"];
+        let mut allowed_roots = Vec::with_capacity(narrow_paths.len());
+
+        for name in &narrow_paths {
+            let full = workspace_root.join(name);
+            if let Ok(canonical) = fs::canonicalize(&full) {
+                // Defense against symlink escape: reject canonicalized paths
+                // that resolve outside the workspace (e.g., memory/ symlinked
+                // to /etc would let the heartbeat read arbitrary system files).
+                if canonical.starts_with(&workspace_root) {
+                    allowed_roots.push(canonical);
+                } else {
+                    warn!(
+                        "Heartbeat sandbox: {:?} resolves outside workspace ({}), skipping",
+                        name,
+                        canonical.display()
+                    );
+                }
+            } else {
+                // Path may not exist yet (e.g., HEARTBEAT.md not created);
+                // store the constructed path so writes are validated correctly
+                // via `canonicalize_ancestor`.
+                allowed_roots.push(full);
+            }
+        }
+
+        Self {
+            allowed_roots,
+            workspace_root,
+            scope_description: "HEARTBEAT.md, MEMORY.md, and memory/ within the workspace"
+                .to_string(),
+        }
+    }
+
     /// Build a sandbox from the workspace path and any extra allowed paths from config.
     pub fn new(workspace: &Path, extra_allowed: &[String]) -> Self {
         let mut allowed_roots = Vec::new();
@@ -68,6 +117,7 @@ impl PathSandbox {
         Self {
             allowed_roots,
             workspace_root,
+            scope_description: "the workspace and paths listed in tools.allowed_paths".to_string(),
         }
     }
 
@@ -96,27 +146,48 @@ impl PathSandbox {
         } else {
             // Walk up until we find an existing ancestor we can canonicalize
             let (canonical_ancestor, remainder) = self.canonicalize_ancestor(&path)?;
-            self.check_allowed(&canonical_ancestor, raw_path)?;
-            Ok(canonical_ancestor.join(remainder))
+            let full_path = canonical_ancestor.join(&remainder);
+            // Check the ancestor first (covers directory-level roots like
+            // workspace/ or memory/), then fall back to the full reconstructed
+            // path (covers file-level roots like HEARTBEAT.md where the file
+            // doesn't exist yet and the ancestor is the parent directory).
+            // Use the non-logging predicate for the first attempt so valid
+            // file-level writes don't emit a false-positive security warning.
+            if !self.is_allowed(&canonical_ancestor) && !self.is_allowed(&full_path) {
+                self.deny(raw_path, &full_path)?;
+            }
+            Ok(full_path)
         }
     }
 
+    /// Pure predicate: does the canonicalized path fall under any allowed root?
+    fn is_allowed(&self, canonical: &Path) -> bool {
+        self.allowed_roots
+            .iter()
+            .any(|root| canonical.starts_with(root))
+    }
+
     /// Check whether a canonicalized path falls under any allowed root.
+    /// Logs a warning and returns an error if denied.
     fn check_allowed(&self, canonical: &Path, original: &str) -> Result<()> {
-        for root in &self.allowed_roots {
-            if canonical.starts_with(root) {
-                return Ok(());
-            }
+        if self.is_allowed(canonical) {
+            return Ok(());
         }
+        self.deny(original, canonical)
+    }
+
+    /// Emit a warning and return an access-denied error.
+    fn deny(&self, original: &str, resolved: &Path) -> Result<()> {
         warn!(
             "Path access denied — outside sandbox: {} (resolved: {})",
             original,
-            canonical.display()
+            resolved.display()
         );
         anyhow::bail!(
             "Access denied: path '{}' is outside the allowed directories. \
-             File tools may only access the workspace and paths listed in tools.allowed_paths.",
-            original
+             File tools may only access {}.",
+            original,
+            self.scope_description
         )
     }
 
@@ -185,48 +256,82 @@ pub fn create_default_tools(
     ])
 }
 
+/// Known tool names for validation of `heartbeat.allowed_tools` entries.
+const KNOWN_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "memory_search",
+    "memory_get",
+    "web_fetch",
+];
+
 /// Create a restricted tool set for the heartbeat agent.
 ///
 /// Only tools named in `config.heartbeat.allowed_tools` are instantiated.
 /// Tools not on the allowlist simply do not exist in the returned vec —
 /// this is a hard construction-time restriction, not a runtime gate.
 ///
-/// Implementation note: we construct all default tools then filter down to the
-/// allowlist. This is slightly wasteful (discarded tools are allocated then
-/// dropped) but keeps the logic simple — a name→constructor factory would add
-/// complexity that isn't justified for the small number of tools involved.
+/// File tools (`read_file`, `write_file`, `edit_file`) use a restricted
+/// `PathSandbox` that only allows access to `HEARTBEAT.md`, `MEMORY.md`,
+/// and the `memory/` subdirectory. This is a defense-in-depth measure
+/// to limit the blast radius of prompt injection via HEARTBEAT.md content.
 pub fn create_heartbeat_tools(
     config: &Config,
     memory: Option<Arc<MemoryManager>>,
 ) -> Result<Vec<Box<dyn Tool>>> {
-    let all_tools = create_default_tools(config, memory)?;
-    let total = all_tools.len();
+    let workspace = config.workspace_path();
     let allowed = &config.heartbeat.allowed_tools;
 
-    let filtered: Vec<Box<dyn Tool>> = all_tools
-        .into_iter()
-        .filter(|t| allowed.iter().any(|a| a == t.name()))
-        .collect();
+    // Use a restricted sandbox — only HEARTBEAT.md, MEMORY.md, and memory/
+    let sandbox = Arc::new(PathSandbox::new_heartbeat(&workspace));
 
-    // Warn about allowlist entries that don't match any known tool (config typos)
-    let matched_names: Vec<&str> = filtered.iter().map(|t| t.name()).collect();
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
     for name in allowed {
-        if !matched_names.contains(&name.as_str()) {
-            warn!(
-                "Heartbeat allowed_tools entry {:?} does not match any known tool — check config for typos",
-                name
-            );
+        if !seen.insert(name.as_str()) {
+            continue; // skip duplicate entries
+        }
+        match name.as_str() {
+            "read_file" => tools.push(Box::new(ReadFileTool::new(Arc::clone(&sandbox)))),
+            "write_file" => tools.push(Box::new(WriteFileTool::new(Arc::clone(&sandbox)))),
+            "edit_file" => tools.push(Box::new(EditFileTool::new(Arc::clone(&sandbox)))),
+            "memory_search" => {
+                let tool: Box<dyn Tool> = if let Some(ref mem) = memory {
+                    Box::new(MemorySearchToolWithIndex::new(Arc::clone(mem)))
+                } else {
+                    Box::new(MemorySearchTool::new(workspace.clone()))
+                };
+                tools.push(tool);
+            }
+            "memory_get" => tools.push(Box::new(MemoryGetTool::new(workspace.clone()))),
+            "bash" => tools.push(Box::new(BashTool::new(config.tools.bash_timeout_ms))),
+            "web_fetch" => {
+                tools.push(Box::new(WebFetchTool::new(
+                    config.tools.web_fetch_max_bytes,
+                    config.tools.web_fetch_timeout_secs,
+                )?));
+            }
+            unknown => {
+                warn!(
+                    "Heartbeat allowed_tools entry {:?} does not match any known tool — \
+                     check config for typos (known: {:?})",
+                    unknown, KNOWN_TOOL_NAMES
+                );
+            }
         }
     }
 
+    let matched_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     debug!(
-        "Heartbeat tools: {} of {} total allowed ({:?})",
-        filtered.len(),
-        total,
+        "Heartbeat tools: {} allowed ({:?})",
+        tools.len(),
         matched_names
     );
 
-    Ok(filtered)
+    Ok(tools)
 }
 
 // Bash Tool
@@ -1522,6 +1627,216 @@ mod tests {
         let tools = create_heartbeat_tools(&config, None).unwrap();
 
         assert!(tools.is_empty(), "empty allowlist should produce no tools");
+    }
+
+    #[test]
+    fn test_known_tool_names_matches_default_tools() {
+        let config = Config::default();
+        let tools = create_default_tools(&config, None).unwrap();
+        let default_names: std::collections::HashSet<&str> =
+            tools.iter().map(|t| t.name()).collect();
+        let known: std::collections::HashSet<&str> = KNOWN_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(
+            default_names, known,
+            "KNOWN_TOOL_NAMES must stay in sync with create_default_tools()"
+        );
+    }
+
+    // --- Heartbeat PathSandbox restriction tests ---
+
+    fn setup_heartbeat_sandbox() -> (TempDir, PathSandbox) {
+        let workspace = TempDir::new().unwrap();
+        // Create the files/dirs the heartbeat sandbox allows
+        fs::write(workspace.path().join("HEARTBEAT.md"), "- [ ] task").unwrap();
+        fs::write(workspace.path().join("MEMORY.md"), "memory").unwrap();
+        let mem_dir = workspace.path().join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join("2024-01-01.md"), "log").unwrap();
+
+        // Create files the heartbeat should NOT be able to access
+        fs::write(workspace.path().join("IDENTITY.md"), "identity").unwrap();
+        fs::write(workspace.path().join("SOUL.md"), "soul").unwrap();
+        fs::write(workspace.path().join("secrets.env"), "API_KEY=xxx").unwrap();
+        let src_dir = workspace.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("main.rs"), "fn main() {}").unwrap();
+
+        let sandbox = PathSandbox::new_heartbeat(workspace.path());
+        (workspace, sandbox)
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_allows_heartbeat_md() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("HEARTBEAT.md");
+        assert!(sandbox.validate(path.to_str().unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_allows_memory_md() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("MEMORY.md");
+        assert!(sandbox.validate(path.to_str().unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_allows_memory_dir_files() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("memory/2024-01-01.md");
+        assert!(sandbox.validate(path.to_str().unwrap(), true).is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_denies_identity_md() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("IDENTITY.md");
+        let result = sandbox.validate(path.to_str().unwrap(), true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_denies_soul_md() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("SOUL.md");
+        let result = sandbox.validate(path.to_str().unwrap(), true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_denies_arbitrary_workspace_files() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("secrets.env");
+        let result = sandbox.validate(path.to_str().unwrap(), true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_denies_src_dir() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("src/main.rs");
+        let result = sandbox.validate(path.to_str().unwrap(), true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_denies_outside_workspace() {
+        let (_workspace, sandbox) = setup_heartbeat_sandbox();
+        let result = sandbox.validate("/etc/passwd", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_denies_traversal() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let traversal = format!("{}/memory/../../etc/passwd", workspace.path().display());
+        let result = sandbox.validate(&traversal, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_write_new_memory_file() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let path = workspace.path().join("memory/2024-06-15.md");
+        // File doesn't exist yet — must_exist=false (write path)
+        let result = sandbox.validate(path.to_str().unwrap(), false);
+        assert!(
+            result.is_ok(),
+            "Should allow writing new files under memory/: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_write_new_heartbeat_md_when_missing() {
+        let workspace = TempDir::new().unwrap();
+        // Do NOT create HEARTBEAT.md — test the write path when file is absent
+        let mem_dir = workspace.path().join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+
+        let sandbox = PathSandbox::new_heartbeat(workspace.path());
+        let path = workspace.path().join("HEARTBEAT.md");
+        let result = sandbox.validate(path.to_str().unwrap(), false);
+        assert!(
+            result.is_ok(),
+            "Should allow creating HEARTBEAT.md when missing: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_write_new_memory_md_when_missing() {
+        let workspace = TempDir::new().unwrap();
+        // Do NOT create MEMORY.md — test the write path when file is absent
+        let mem_dir = workspace.path().join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+
+        let sandbox = PathSandbox::new_heartbeat(workspace.path());
+        let path = workspace.path().join("MEMORY.md");
+        let result = sandbox.validate(path.to_str().unwrap(), false);
+        assert!(
+            result.is_ok(),
+            "Should allow creating MEMORY.md when missing: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_sandbox_write_denies_arbitrary_workspace_file() {
+        let (_workspace, sandbox) = setup_heartbeat_sandbox();
+        let result = sandbox.validate("new_file.txt", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_heartbeat_sandbox_denies_symlink_escape_via_memory() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let secret = external.path().join("secret.txt");
+        fs::write(&secret, "sensitive data").unwrap();
+
+        // Symlink memory/ -> external dir (attacker-controlled symlink)
+        std::os::unix::fs::symlink(external.path(), workspace.path().join("memory")).unwrap();
+        fs::write(workspace.path().join("HEARTBEAT.md"), "task").unwrap();
+
+        let sandbox = PathSandbox::new_heartbeat(workspace.path());
+
+        // The symlinked memory/ should be excluded from allowed_roots
+        let target = workspace.path().join("memory/secret.txt");
+        let result = sandbox.validate(target.to_str().unwrap(), true);
+        assert!(
+            result.is_err(),
+            "Symlinked memory/ to external dir should be denied: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_read_file_tool_allows_heartbeat_md() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let tool = ReadFileTool::new(Arc::new(sandbox));
+        let path = workspace.path().join("HEARTBEAT.md");
+        let args = serde_json::json!({"path": path.to_str().unwrap()}).to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("task"));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_read_file_tool_denies_other_workspace_files() {
+        let (workspace, sandbox) = setup_heartbeat_sandbox();
+        let tool = ReadFileTool::new(Arc::new(sandbox));
+        let path = workspace.path().join("IDENTITY.md");
+        let args = serde_json::json!({"path": path.to_str().unwrap()}).to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Access denied"));
     }
 
     // --- WebFetchTool URL validation tests ---
