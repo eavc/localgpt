@@ -30,3 +30,7 @@ target
 docs/internal/
 
 docs/security/audits/
+
+.claude/
+.codex/
+.beads/
