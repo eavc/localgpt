@@ -31,10 +31,16 @@ pub async fn run_sandboxed(
     // Build the child command. We use .output() wrapped in timeout, with
     // kill_on_drop as a safety net. On timeout, we explicitly handle the error
     // and tokio's kill_on_drop ensures the child is cleaned up.
+    //
+    // SECURITY: env_clear() prevents sandboxed commands from reading parent
+    // API keys via `env`/`printenv`. Only minimal, non-secret variables are
+    // forwarded. See SEC-15.
     let output_fut = tokio::process::Command::new(&exe_path)
         .arg0("localgpt-sandbox")
         .arg(&policy_json)
         .arg(command)
+        .env_clear()
+        .envs(sandbox_env())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -102,6 +108,29 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// The set of environment variables forwarded to sandboxed child processes.
+///
+/// Returns `(key, value)` pairs. Values are either hardcoded safe defaults
+/// or inherited non-secret values from the parent. No API keys, tokens,
+/// or credentials are included.
+fn sandbox_env() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "PATH",
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+        ),
+        (
+            "HOME",
+            super::policy::dirs_home().to_string_lossy().into_owned(),
+        ),
+        ("TERM", "dumb".to_string()),
+        (
+            "LANG",
+            std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".to_string()),
+        ),
+    ]
+}
+
 /// Trait extension for Command to set argv[0].
 /// The trait itself is "dead" from the compiler's perspective because it's only
 /// used implicitly via the impl — but the impl IS needed for arg0() calls above.
@@ -124,5 +153,184 @@ impl CommandExt for tokio::process::Command {
     fn arg0(&mut self, _arg0: &str) -> &mut Self {
         // argv[0] dispatch not supported on non-unix platforms
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process environment via set_var/remove_var.
+    /// Process env is global state; concurrent mutation is UB in Rust >=1.83.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_sandbox_env_contains_only_safe_vars() {
+        let env = sandbox_env();
+        let keys: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+
+        assert_eq!(keys, vec!["PATH", "HOME", "TERM", "LANG"]);
+    }
+
+    #[test]
+    fn test_sandbox_env_path_is_hardcoded() {
+        let env = sandbox_env();
+        let (_, path_val) = env.iter().find(|(k, _)| *k == "PATH").unwrap();
+
+        assert_eq!(path_val, "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    }
+
+    #[test]
+    fn test_sandbox_env_term_is_dumb() {
+        let env = sandbox_env();
+        let (_, term_val) = env.iter().find(|(k, _)| *k == "TERM").unwrap();
+
+        assert_eq!(term_val, "dumb");
+    }
+
+    #[test]
+    fn test_sandbox_env_no_api_keys() {
+        let env = sandbox_env();
+        let keys: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+
+        let secret_keys = [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "GITHUB_TOKEN",
+            "LOCALGPT_API_KEY",
+        ];
+        for secret in &secret_keys {
+            assert!(
+                !keys.contains(secret),
+                "{} must not be in sandbox env",
+                secret
+            );
+        }
+    }
+
+    /// Verify that a child process spawned with env_clear() + sandbox_env()
+    /// does not inherit parent secrets.
+    #[tokio::test]
+    async fn test_sandbox_child_env_is_scrubbed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // SAFETY: ENV_LOCK serializes all env-mutating tests. No other test
+        // in this binary mutates these specific keys.
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "sk-test-secret-key");
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-secret");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/test");
+        }
+
+        let output = tokio::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg("env")
+            .env_clear()
+            .envs(sandbox_env())
+            .output()
+            .await
+            .expect("failed to run env");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Secrets must not appear
+        assert!(
+            !stdout.contains("sk-test-secret-key"),
+            "OPENAI_API_KEY leaked to child"
+        );
+        assert!(
+            !stdout.contains("sk-ant-test-secret"),
+            "ANTHROPIC_API_KEY leaked to child"
+        );
+        assert!(
+            !stdout.contains("wJalrXUtnFEMI"),
+            "AWS_SECRET_ACCESS_KEY leaked to child"
+        );
+
+        // Allowed vars must be present
+        assert!(stdout.contains("PATH="), "PATH missing from child env");
+        assert!(stdout.contains("HOME="), "HOME missing from child env");
+        assert!(stdout.contains("LANG="), "LANG missing from child env");
+        assert!(
+            stdout.contains("TERM=dumb"),
+            "TERM=dumb missing from child env"
+        );
+
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        }
+    }
+
+    /// Verify that `printenv <KEY>` for a secret returns empty in the child.
+    #[tokio::test]
+    async fn test_sandbox_printenv_specific_key_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // SAFETY: ENV_LOCK serializes all env-mutating tests.
+        unsafe {
+            std::env::set_var("TEST_SECRET", "hunter2");
+        }
+
+        let output = tokio::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg("printenv TEST_SECRET")
+            .env_clear()
+            .envs(sandbox_env())
+            .output()
+            .await
+            .expect("failed to run printenv");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("hunter2"),
+            "TEST_SECRET leaked to child env"
+        );
+        assert_ne!(output.status.code(), Some(0));
+
+        unsafe {
+            std::env::remove_var("TEST_SECRET");
+        }
+    }
+
+    /// Verify that basic commands work with the scrubbed environment.
+    #[tokio::test]
+    async fn test_sandbox_path_is_functional() {
+        let output = tokio::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg("which echo")
+            .env_clear()
+            .envs(sandbox_env())
+            .output()
+            .await
+            .expect("failed to run which");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("/echo"),
+            "echo not found in PATH — got: {}",
+            stdout.trim()
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    #[test]
+    fn test_truncate_utf8_basic() {
+        assert_eq!(truncate_utf8("hello", 3), "hel");
+        assert_eq!(truncate_utf8("hello", 10), "hello");
+        assert_eq!(truncate_utf8("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_utf8_multibyte() {
+        // '€' is 3 bytes in UTF-8
+        let s = "€€";
+        assert_eq!(truncate_utf8(s, 3), "€");
+        assert_eq!(truncate_utf8(s, 4), "€");
+        assert_eq!(truncate_utf8(s, 6), "€€");
     }
 }

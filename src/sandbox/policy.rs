@@ -100,7 +100,9 @@ fn default_read_only_paths() -> Vec<PathBuf> {
             PathBuf::from("/sbin"),
             PathBuf::from("/etc"),
             PathBuf::from("/dev"),
-            PathBuf::from("/proc/self"),
+            // /proc/self intentionally excluded — exposes /proc/self/environ
+            // which contains the parent process's full environment including
+            // API keys, bypassing env_clear(). See SEC-15.
         ]
     }
     #[cfg(target_os = "macos")]
@@ -126,7 +128,7 @@ fn default_read_only_paths() -> Vec<PathBuf> {
     }
 }
 
-fn dirs_home() -> PathBuf {
+pub(super) fn dirs_home() -> PathBuf {
     directories::BaseDirs::new()
         .map(|b| b.home_dir().to_path_buf())
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -354,6 +356,23 @@ mod tests {
             &PathBuf::from("/usr/share/dict"),
             &deny_paths
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_default_read_only_paths_excludes_proc_self() {
+        // SEC-15: /proc/self must not be in the default read-only paths because
+        // it exposes /proc/self/environ which contains the parent's full
+        // environment including API keys. Linux-only since /proc is a Linux concept.
+        let paths = default_read_only_paths();
+        let has_proc_self = paths.iter().any(|p| {
+            let s = p.to_string_lossy();
+            s == "/proc/self" || s.starts_with("/proc/self/")
+        });
+        assert!(
+            !has_proc_self,
+            "default_read_only_paths must not include /proc/self (credential leak via /proc/self/environ)"
+        );
     }
 
     #[test]
