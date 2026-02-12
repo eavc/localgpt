@@ -157,7 +157,7 @@ async function loadSessionMessages(sessionId) {
                     for (const tc of msg.tool_calls) {
                         const toolDiv = document.createElement('div');
                         toolDiv.className = 'message tool';
-                        toolDiv.innerHTML = `<span class="tool-name">[${tc.name}]</span>`;
+                        toolDiv.innerHTML = `<span class="tool-name">[${escapeHtml(tc.name)}]</span>`;
                         div.after(toolDiv);
                     }
                 }
@@ -266,8 +266,8 @@ function handleEvent(event, assistantDiv) {
             toolStartDiv.className = 'message tool';
             toolStartDiv.id = `tool-${event.id}`;
             const toolLabel = event.detail
-                ? `[${event.name}: ${escapeHtml(event.detail)}]`
-                : `[${event.name}]`;
+                ? `[${escapeHtml(event.name)}: ${escapeHtml(event.detail)}]`
+                : `[${escapeHtml(event.name)}]`;
             toolStartDiv.innerHTML = `<span class="tool-name">${toolLabel}</span> Running...`;
             assistantDiv.after(toolStartDiv);
             scrollToBottom();
@@ -277,7 +277,7 @@ function handleEvent(event, assistantDiv) {
             const toolEl = document.getElementById(`tool-${event.id}`);
             if (toolEl) {
                 const output = event.output ? event.output.slice(0, 300) : 'Done';
-                toolEl.innerHTML = `<span class="tool-name">[${event.name}]</span><div class="tool-output">${escapeHtml(output)}</div>`;
+                toolEl.innerHTML = `<span class="tool-name">[${escapeHtml(event.name)}]</span><div class="tool-output">${escapeHtml(output)}</div>`;
             }
             scrollToBottom();
             break;
@@ -484,7 +484,7 @@ function updateStatusPanel(status, heartbeat) {
     const statusClass = event.status;
 
     statusDot.className = `status-dot ${statusClass}`;
-    heartbeatStatusEl.innerHTML = `<span class="heartbeat-badge ${statusClass}">${formatHeartbeatStatus(event.status)}</span>`;
+    heartbeatStatusEl.innerHTML = `<span class="heartbeat-badge ${escapeHtml(statusClass)}">${escapeHtml(formatHeartbeatStatus(event.status))}</span>`;
 
     // Format last run time
     if (event.age_seconds !== undefined) {
@@ -632,7 +632,7 @@ async function loadSavedSessions() {
         `).join('');
     } catch (err) {
         console.error('Failed to load saved sessions:', err);
-        document.getElementById('sessions-list').innerHTML = `<div class="session-item error">Error: ${err.message}</div>`;
+        document.getElementById('sessions-list').innerHTML = `<div class="session-item error">Error: ${escapeHtml(err.message)}</div>`;
     }
 }
 
@@ -679,7 +679,7 @@ function renderSessionMessage(msg) {
             html += `
                 <div class="tool-call-block" onclick="this.classList.toggle('expanded')">
                     <div class="tool-call-header">
-                        <span>[${tc.name}]</span>
+                        <span>[${escapeHtml(tc.name)}]</span>
                         <span>\u25BC</span>
                     </div>
                     <div class="tool-call-body">${escapeHtml(formattedArgs)}</div>

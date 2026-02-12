@@ -185,7 +185,7 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
             "  Server: http://{}:{}",
             config.server.bind, config.server.port
         );
-        println!("  API key: {}...", &config.server.api_key[..8]);
+        println!("{}", format_api_key_status(&config.server.api_key));
         let server = Server::new_with_gate(config, turn_gate)?;
         server.run().await?;
     } else if heartbeat_handle.is_some() {
@@ -480,6 +480,16 @@ fn prune_old_logs(logs_dir: &std::path::Path, keep_days: i64) {
     }
 }
 
+/// Format the API key status line for the daemon startup banner.
+/// Never includes the actual key or any prefix of it.
+fn format_api_key_status(api_key: &str) -> String {
+    if api_key.is_empty() {
+        "  API key: not set (WARNING: API is unauthenticated)".to_string()
+    } else {
+        "  API key: configured".to_string()
+    }
+}
+
 fn is_process_running(pid: &str) -> bool {
     let pid = pid.trim();
 
@@ -501,5 +511,27 @@ fn is_process_running(pid: &str) -> bool {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(pid))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_key_status_configured_does_not_leak_key() {
+        let key = "super-secret-api-key-12345678";
+        let status = format_api_key_status(key);
+        assert!(status.contains("configured"));
+        assert!(!status.contains(key));
+        // No substring of the key should appear (check first 8 chars specifically)
+        assert!(!status.contains(&key[..8]));
+    }
+
+    #[test]
+    fn test_api_key_status_empty_warns_unauthenticated() {
+        let status = format_api_key_status("");
+        assert!(status.contains("not set"));
+        assert!(status.contains("unauthenticated"));
     }
 }

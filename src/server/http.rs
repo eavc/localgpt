@@ -136,7 +136,7 @@ async fn enforce_rate_limit(
     next.run(request).await
 }
 
-/// Auth middleware: validates API key via bearer token, query param, or same-origin bypass.
+/// Auth middleware: validates API key via bearer token or same-origin bypass.
 async fn require_api_key(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -170,22 +170,11 @@ async fn require_api_key(
         // Invalid auth header — fall through to 401
     }
 
-    // 3. Query param fallback (?api_key=...)
-    if let Some(query) = request.uri().query() {
-        for pair in query.split('&') {
-            if let Some(key) = pair.strip_prefix("api_key=") {
-                if key == state.api_key {
-                    return next.run(request).await;
-                }
-            }
-        }
-    }
-
-    // 4. Reject
+    // 3. Reject
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, "Bearer")],
-        "Unauthorized: provide a valid API key via Authorization header or api_key query param",
+        "Unauthorized: provide a valid API key via Authorization: Bearer <key> header",
     )
         .into_response()
 }
@@ -1820,7 +1809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_api_query_param_accepted() {
+    async fn test_api_query_param_rejected() {
         let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
@@ -1830,7 +1819,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
