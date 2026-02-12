@@ -38,8 +38,8 @@ The following concepts were directly inspired by OpenClaw:
    - JSONL transcript storage
 
 4. **Tool System**
-   - Bash execution
-   - File operations (read, write, edit) — sandboxed via `PathSandbox` to workspace and configured `tools.allowed_paths`
+   - Bash execution — kernel-enforced sandbox via `SandboxPolicy` (Landlock + seccomp on Linux, Seatbelt on macOS)
+   - File operations (read, write, edit) — sandboxed via `PathSandbox` to workspace and configured `tools.allowed_paths`, with credential deny path enforcement via `SandboxPolicy`
    - Memory search and append
 
 ### Key Differences

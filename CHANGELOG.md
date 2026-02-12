@@ -20,6 +20,32 @@ Changes:
 - Rate limiting added: configurable via `server.rate_limit_per_minute`
   (default 120 requests/minute, 0 = unlimited).
 
+#### Kernel-enforced shell sandbox for bash tool (localgpt-359)
+
+Shell commands executed by the `bash` tool now run inside a kernel-enforced
+sandbox. On Linux, Landlock LSM restricts filesystem access (workspace +
+`/tmp` writable, system dirs read-only, credential directories denied) and
+seccomp-bpf blocks network syscalls. On macOS, Seatbelt profiles provide
+equivalent compile-time support.
+
+The sandbox uses an argv[0] re-exec pattern: the parent forks itself as
+`localgpt-sandbox`, and the child applies rlimits, Landlock rules, and
+seccomp filters before exec'ing bash. Enforcement is fail-closed at
+Standard+ (Landlock) and Minimal+ (seccomp) levels.
+
+Configure in `config.toml`:
+
+```toml
+[sandbox]
+enabled = true
+level = "auto"        # auto | full | standard | minimal | none
+timeout_secs = 30
+```
+
+Credential directories (`~/.ssh`, `~/.aws`, `~/.gnupg`, etc.) are always
+denied. User-provided `allow_paths` that overlap credential directories
+are automatically pruned.
+
 #### File tools sandboxed to prevent unrestricted filesystem access (SEC-01)
 
 File tools (`read_file`, `write_file`, `edit_file`) now validate all paths

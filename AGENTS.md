@@ -59,6 +59,7 @@ LocalGPT is a local-only AI assistant with persistent markdown-based memory and 
 - **desktop/** - Optional eframe/egui native GUI (behind `desktop` feature flag)
 - **config/** - TOML config at `~/.localgpt/config.toml` with `${ENV_VAR}` expansion and OpenClaw auto-migration
 - **cli/** - Clap-based subcommands: `chat`, `ask`, `daemon`, `memory`, `config`, `desktop`
+- **sandbox/** - Kernel-enforced shell sandbox (Landlock + seccomp on Linux, Seatbelt on macOS). Policy construction, capability detection, argv[0] re-exec child, executor with timeout/truncation
 - **concurrency/** - `TurnGate` (serializes agent turns) and `WorkspaceLock` (file-based workspace locking)
 
 ### Key Architectural Patterns

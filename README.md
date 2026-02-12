@@ -80,6 +80,11 @@ workspace = "~/.localgpt/workspace"
 [tools]
 # Additional paths that file tools may access (workspace is always allowed)
 # allowed_paths = ["/tmp/localgpt", "~/projects"]
+
+[sandbox]
+enabled = true
+level = "auto"       # auto | full | standard | minimal | none
+timeout_secs = 30
 ```
 
 ## CLI Commands
@@ -104,6 +109,10 @@ localgpt memory stats             # Show statistics
 # Config
 localgpt config init              # Create default config
 localgpt config show              # Show current config
+
+# Sandbox
+localgpt sandbox status           # Show sandbox capabilities
+localgpt sandbox test             # Run sandbox smoke tests
 ```
 
 ## HTTP API
