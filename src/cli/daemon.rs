@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use daemonize::Daemonize;
 
+use localgpt::agent::{build_sandbox_enforcement, SandboxEnforcement};
 use localgpt::concurrency::TurnGate;
 use localgpt::config::Config;
 use localgpt::heartbeat::HeartbeatRunner;
@@ -178,6 +179,10 @@ async fn run_daemon_services(config: &Config, agent_id: &str) -> Result<()> {
     } else {
         None
     };
+
+    // Show sandbox enforcement status
+    let enforcement = build_sandbox_enforcement(config, &config.workspace_path());
+    println!("{}", format_sandbox_status(&enforcement));
 
     // Run server or wait for shutdown
     if config.server.enabled {
@@ -480,6 +485,38 @@ fn prune_old_logs(logs_dir: &std::path::Path, keep_days: i64) {
     }
 }
 
+/// Format the sandbox enforcement status line for the daemon startup banner.
+fn format_sandbox_status(enforcement: &SandboxEnforcement) -> String {
+    match enforcement {
+        SandboxEnforcement::Active(policy) => {
+            let caps = localgpt::sandbox::detect_capabilities();
+            let level = format!("{:?}", policy.level);
+
+            let mut details = Vec::new();
+            if let Some(abi) = caps.landlock_abi {
+                details.push(format!("Landlock v{}", abi));
+            }
+            if caps.seccomp_available {
+                details.push("seccomp".to_string());
+            }
+            if caps.seatbelt_available {
+                details.push("Seatbelt".to_string());
+            }
+
+            if details.is_empty() {
+                format!("  Sandbox: enforcing ({})", level)
+            } else {
+                format!("  Sandbox: enforcing ({}, {})", level, details.join(" + "))
+            }
+        }
+        SandboxEnforcement::FailClosed => {
+            "  Sandbox: DEGRADED — enabled but no platform support detected (shell commands will be refused)"
+                .to_string()
+        }
+        SandboxEnforcement::Disabled => "  Sandbox: disabled".to_string(),
+    }
+}
+
 /// Format the API key status line for the daemon startup banner.
 /// Never includes the actual key or any prefix of it.
 fn format_api_key_status(api_key: &str) -> String {
@@ -517,6 +554,47 @@ fn is_process_running(pid: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sandbox_status_disabled() {
+        let status = format_sandbox_status(&SandboxEnforcement::Disabled);
+        assert!(
+            status.contains("disabled"),
+            "Disabled should say disabled: got {status}"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_status_fail_closed() {
+        let status = format_sandbox_status(&SandboxEnforcement::FailClosed);
+        assert!(
+            status.contains("DEGRADED"),
+            "FailClosed should say DEGRADED: got {status}"
+        );
+        assert!(
+            status.contains("refused"),
+            "FailClosed should mention refusal: got {status}"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_status_active() {
+        use localgpt::sandbox::{build_policy, SandboxLevel};
+
+        let config = localgpt::config::SandboxConfig::default();
+        let policy = build_policy(
+            &config,
+            std::path::Path::new("/tmp"),
+            SandboxLevel::Standard,
+        );
+        let enforcement = SandboxEnforcement::Active(std::sync::Arc::new(policy));
+
+        let status = format_sandbox_status(&enforcement);
+        assert!(
+            status.contains("enforcing"),
+            "Active should say enforcing: got {status}"
+        );
+    }
 
     #[test]
     fn test_api_key_status_configured_does_not_leak_key() {

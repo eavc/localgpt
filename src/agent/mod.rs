@@ -27,7 +27,9 @@ pub use system_prompt::{
     build_heartbeat_prompt, is_heartbeat_ok, is_silent_reply, HEARTBEAT_OK_TOKEN,
     SILENT_REPLY_TOKEN,
 };
-pub use tools::{extract_tool_detail, Tool, ToolResult};
+pub use tools::{
+    build_sandbox_enforcement, extract_tool_detail, SandboxEnforcement, Tool, ToolResult,
+};
 
 use anyhow::Result;
 use std::path::PathBuf;

@@ -15,6 +15,20 @@ use crate::config::Config;
 use crate::memory::MemoryManager;
 use crate::sandbox::{self, SandboxPolicy};
 
+/// Sandbox enforcement state for shell commands.
+///
+/// Makes the three possible states explicit so that `BashTool` cannot silently
+/// fall through to unsandboxed execution when the user has enabled sandboxing.
+#[derive(Debug, Clone)]
+pub enum SandboxEnforcement {
+    /// Kernel sandbox is active with the given policy.
+    Active(Arc<SandboxPolicy>),
+    /// Sandbox enabled in config but kernel cannot enforce — bash must refuse.
+    FailClosed,
+    /// Sandbox not enabled in config — run bash directly (user accepts the risk).
+    Disabled,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub call_id: String,
@@ -236,8 +250,9 @@ pub fn create_default_tools(
     let workspace = config.workspace_path();
     let sandbox = Arc::new(PathSandbox::new(&workspace, &config.tools.allowed_paths));
 
-    // Build sandbox policy if enabled
-    let sandbox_policy = build_sandbox_policy(config, &workspace);
+    // Build sandbox enforcement state and extract policy for file tools
+    let enforcement = build_sandbox_enforcement(config, &workspace);
+    let sandbox_policy = enforcement.policy();
 
     // Use indexed memory search if MemoryManager is provided, otherwise fallback to grep-based
     let memory_search_tool: Box<dyn Tool> = if let Some(ref mem) = memory {
@@ -247,22 +262,16 @@ pub fn create_default_tools(
     };
 
     Ok(vec![
-        Box::new(BashTool::new(
-            config.tools.bash_timeout_ms,
-            sandbox_policy.as_ref().map(Arc::clone),
-        )),
+        Box::new(BashTool::new(config.tools.bash_timeout_ms, enforcement)),
         Box::new(ReadFileTool::new(
             Arc::clone(&sandbox),
-            sandbox_policy.as_ref().map(Arc::clone),
+            sandbox_policy.clone(),
         )),
         Box::new(WriteFileTool::new(
             Arc::clone(&sandbox),
-            sandbox_policy.as_ref().map(Arc::clone),
+            sandbox_policy.clone(),
         )),
-        Box::new(EditFileTool::new(
-            Arc::clone(&sandbox),
-            sandbox_policy.as_ref().map(Arc::clone),
-        )),
+        Box::new(EditFileTool::new(Arc::clone(&sandbox), sandbox_policy)),
         memory_search_tool,
         Box::new(MemoryGetTool::new(workspace)),
         Box::new(WebFetchTool::new(
@@ -272,31 +281,65 @@ pub fn create_default_tools(
     ])
 }
 
-/// Build a sandbox policy from config if sandbox is enabled and platform supports it.
-/// Returns an `Arc` so the policy can be shared across tools without deep-cloning path vectors.
-fn build_sandbox_policy(
+/// Build sandbox enforcement state from config and detected kernel capabilities.
+///
+/// Returns `SandboxEnforcement` which makes the three states explicit:
+/// - `Active(policy)` — kernel sandbox is available and will be used
+/// - `FailClosed` — sandbox enabled but kernel can't enforce → shell commands refused
+/// - `Disabled` — sandbox not enabled in config
+pub fn build_sandbox_enforcement(
     config: &Config,
     workspace: &std::path::Path,
-) -> Option<Arc<SandboxPolicy>> {
-    if config.sandbox.enabled {
-        let caps = sandbox::detect_capabilities();
-        let effective = caps.effective_level(config.sandbox.level);
-        if effective > sandbox::SandboxLevel::None {
-            Some(Arc::new(sandbox::build_policy(
-                &config.sandbox,
-                workspace,
-                effective,
-            )))
-        } else {
-            tracing::warn!(
-                "Sandbox enabled but no kernel support detected (level: {:?}). \
-                 Commands will run without sandbox enforcement.",
-                caps.level
-            );
-            None
-        }
+) -> SandboxEnforcement {
+    let caps = sandbox::detect_capabilities();
+    resolve_enforcement(config, workspace, &caps)
+}
+
+/// Core enforcement decision logic, separated for testability.
+///
+/// Accepts pre-detected `SandboxCapabilities` so unit tests can inject
+/// synthetic zero-capability values without requiring live kernel probing.
+fn resolve_enforcement(
+    config: &Config,
+    workspace: &std::path::Path,
+    caps: &sandbox::SandboxCapabilities,
+) -> SandboxEnforcement {
+    if !config.sandbox.enabled {
+        return SandboxEnforcement::Disabled;
+    }
+
+    // Explicit level = "none" is a user opt-out of kernel enforcement,
+    // not a platform limitation. Treat it as Disabled, not FailClosed.
+    if config.sandbox.level == crate::config::SandboxLevelConfig::None {
+        return SandboxEnforcement::Disabled;
+    }
+
+    let effective = caps.effective_level(config.sandbox.level);
+
+    if effective > sandbox::SandboxLevel::None {
+        SandboxEnforcement::Active(Arc::new(sandbox::build_policy(
+            &config.sandbox,
+            workspace,
+            effective,
+        )))
     } else {
-        None
+        tracing::error!(
+            "Sandbox enabled but no platform support detected (effective level: {:?}). \
+             Shell commands will be refused (fail-closed).",
+            caps.level
+        );
+        SandboxEnforcement::FailClosed
+    }
+}
+
+impl SandboxEnforcement {
+    /// Extract the sandbox policy if active, for use by file tools that need
+    /// the credential deny-path list but are not affected by fail-closed mode.
+    pub fn policy(&self) -> Option<Arc<SandboxPolicy>> {
+        match self {
+            SandboxEnforcement::Active(p) => Some(Arc::clone(p)),
+            SandboxEnforcement::FailClosed | SandboxEnforcement::Disabled => None,
+        }
     }
 }
 
@@ -331,8 +374,9 @@ pub fn create_heartbeat_tools(
     // Use a restricted sandbox — only HEARTBEAT.md, MEMORY.md, and memory/
     let sandbox = Arc::new(PathSandbox::new_heartbeat(&workspace));
 
-    // Build sandbox policy for heartbeat too (shell commands are highest-risk surface)
-    let sandbox_policy = build_sandbox_policy(config, &workspace);
+    // Build sandbox enforcement for heartbeat too (shell commands are highest-risk surface)
+    let enforcement = build_sandbox_enforcement(config, &workspace);
+    let sandbox_policy = enforcement.policy();
 
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -344,15 +388,15 @@ pub fn create_heartbeat_tools(
         match name.as_str() {
             "read_file" => tools.push(Box::new(ReadFileTool::new(
                 Arc::clone(&sandbox),
-                sandbox_policy.as_ref().map(Arc::clone),
+                sandbox_policy.clone(),
             ))),
             "write_file" => tools.push(Box::new(WriteFileTool::new(
                 Arc::clone(&sandbox),
-                sandbox_policy.as_ref().map(Arc::clone),
+                sandbox_policy.clone(),
             ))),
             "edit_file" => tools.push(Box::new(EditFileTool::new(
                 Arc::clone(&sandbox),
-                sandbox_policy.as_ref().map(Arc::clone),
+                sandbox_policy.clone(),
             ))),
             "memory_search" => {
                 let tool: Box<dyn Tool> = if let Some(ref mem) = memory {
@@ -365,7 +409,7 @@ pub fn create_heartbeat_tools(
             "memory_get" => tools.push(Box::new(MemoryGetTool::new(workspace.clone()))),
             "bash" => tools.push(Box::new(BashTool::new(
                 config.tools.bash_timeout_ms,
-                sandbox_policy.as_ref().map(Arc::clone),
+                enforcement.clone(),
             ))),
             "web_fetch" => {
                 tools.push(Box::new(WebFetchTool::new(
@@ -396,14 +440,14 @@ pub fn create_heartbeat_tools(
 // Bash Tool
 pub struct BashTool {
     default_timeout_ms: u64,
-    sandbox_policy: Option<Arc<SandboxPolicy>>,
+    enforcement: SandboxEnforcement,
 }
 
 impl BashTool {
-    pub fn new(default_timeout_ms: u64, sandbox_policy: Option<Arc<SandboxPolicy>>) -> Self {
+    pub fn new(default_timeout_ms: u64, enforcement: SandboxEnforcement) -> Self {
         Self {
             default_timeout_ms,
-            sandbox_policy,
+            enforcement,
         }
     }
 }
@@ -450,53 +494,64 @@ impl Tool for BashTool {
             timeout_ms, command
         );
 
-        // Use sandbox if policy is configured
-        if let Some(ref policy) = self.sandbox_policy {
-            let (output, exit_code) = sandbox::run_sandboxed(command, policy, timeout_ms).await?;
+        match &self.enforcement {
+            SandboxEnforcement::Active(policy) => {
+                let (output, exit_code) =
+                    sandbox::run_sandboxed(command, policy, timeout_ms).await?;
 
-            if output.is_empty() {
-                return Ok(format!("Command completed with exit code: {}", exit_code));
+                if output.is_empty() {
+                    Ok(format!("Command completed with exit code: {}", exit_code))
+                } else {
+                    Ok(output)
+                }
             }
-
-            return Ok(output);
-        }
-
-        // Fallback: run command directly without sandbox
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
-        let output = tokio::time::timeout(
-            timeout_duration,
-            tokio::process::Command::new("bash")
-                .arg("-c")
-                .arg(command)
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Command timed out after {}ms", timeout_ms))??;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        let mut result = String::new();
-
-        if !stdout.is_empty() {
-            result.push_str(&stdout);
-        }
-
-        if !stderr.is_empty() {
-            if !result.is_empty() {
-                result.push_str("\n\nSTDERR:\n");
+            SandboxEnforcement::FailClosed => {
+                anyhow::bail!(
+                    "Sandbox is enabled but cannot be enforced on this system \
+                     (no supported isolation mechanism detected). \
+                     Shell commands are disabled for safety. Set sandbox.enabled = false \
+                     to allow unsandboxed execution, or run on a platform with \
+                     Landlock (Linux) or Seatbelt (macOS) support."
+                );
             }
-            result.push_str(&stderr);
-        }
+            SandboxEnforcement::Disabled => {
+                let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+                let output = tokio::time::timeout(
+                    timeout_duration,
+                    tokio::process::Command::new("bash")
+                        .arg("-c")
+                        .arg(command)
+                        .output(),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Command timed out after {}ms", timeout_ms))??;
 
-        if result.is_empty() {
-            result = format!(
-                "Command completed with exit code: {}",
-                output.status.code().unwrap_or(-1)
-            );
-        }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
 
-        Ok(result)
+                let mut result = String::new();
+
+                if !stdout.is_empty() {
+                    result.push_str(&stdout);
+                }
+
+                if !stderr.is_empty() {
+                    if !result.is_empty() {
+                        result.push_str("\n\nSTDERR:\n");
+                    }
+                    result.push_str(&stderr);
+                }
+
+                if result.is_empty() {
+                    result = format!(
+                        "Command completed with exit code: {}",
+                        output.status.code().unwrap_or(-1)
+                    );
+                }
+
+                Ok(result)
+            }
+        }
     }
 }
 
@@ -2545,5 +2600,153 @@ mod tests {
         let metadata_target = "http://169.254.169.254/latest/meta-data/";
         let result = validate_fetch_url(metadata_target).await;
         assert!(result.is_err());
+    }
+
+    // --- SEC-16: SandboxEnforcement fail-closed tests ---
+
+    #[tokio::test]
+    async fn test_bash_tool_fails_closed_when_sandbox_enabled_but_unavailable() {
+        let tool = BashTool::new(30_000, SandboxEnforcement::FailClosed);
+        let args = serde_json::json!({"command": "echo hello"}).to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_err(), "FailClosed should refuse execution");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be enforced"),
+            "Error should explain enforcement failure: got {err}"
+        );
+        assert!(
+            err.contains("sandbox.enabled = false"),
+            "Error should suggest disabling sandbox: got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bash_tool_works_when_sandbox_disabled() {
+        let tool = BashTool::new(30_000, SandboxEnforcement::Disabled);
+        let args = serde_json::json!({"command": "echo hello"}).to_string();
+        let result = tool.execute(&args).await;
+        assert!(result.is_ok(), "Disabled should allow execution");
+        assert!(result.unwrap().contains("hello"), "Should get echo output");
+    }
+
+    #[tokio::test]
+    async fn test_bash_tool_active_attempts_sandboxed_execution() {
+        // Build a minimal policy — we can't actually run sandboxed in tests
+        // (no localgpt-sandbox binary), but we can verify the Active path
+        // is chosen by checking it attempts run_sandboxed (which will fail
+        // with an exec error, not the FailClosed message).
+        let policy = sandbox::build_policy(
+            &crate::config::SandboxConfig::default(),
+            std::path::Path::new("/tmp"),
+            sandbox::SandboxLevel::Standard,
+        );
+        let tool = BashTool::new(30_000, SandboxEnforcement::Active(Arc::new(policy)));
+        let args = serde_json::json!({"command": "echo hello"}).to_string();
+        let result = tool.execute(&args).await;
+        // The sandboxed path will fail (no re-exec binary in tests), but the
+        // error should NOT be the FailClosed message — it should be an I/O or
+        // exec error from run_sandboxed.
+        match result {
+            Ok(_) => {} // Sandbox somehow worked — fine
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("cannot be enforced"),
+                    "Active should not produce FailClosed error: got {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_enforcement_returns_disabled_when_not_enabled() {
+        let mut config = Config::default();
+        config.sandbox.enabled = false;
+        let caps = sandbox::SandboxCapabilities {
+            landlock_abi: Some(5),
+            seccomp_available: true,
+            seatbelt_available: false,
+            level: sandbox::SandboxLevel::Full,
+        };
+        let result = resolve_enforcement(&config, std::path::Path::new("/tmp"), &caps);
+        assert!(
+            matches!(result, SandboxEnforcement::Disabled),
+            "sandbox.enabled = false should produce Disabled regardless of kernel capabilities"
+        );
+    }
+
+    #[test]
+    fn test_resolve_enforcement_returns_disabled_when_level_none() {
+        let mut config = Config::default();
+        config.sandbox.enabled = true;
+        config.sandbox.level = crate::config::SandboxLevelConfig::None;
+        let caps = sandbox::SandboxCapabilities {
+            landlock_abi: Some(5),
+            seccomp_available: true,
+            seatbelt_available: false,
+            level: sandbox::SandboxLevel::Full,
+        };
+        let result = resolve_enforcement(&config, std::path::Path::new("/tmp"), &caps);
+        assert!(
+            matches!(result, SandboxEnforcement::Disabled),
+            "sandbox.enabled = true + level = none should produce Disabled (explicit opt-out)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_enforcement_returns_fail_closed_when_no_kernel_support() {
+        let mut config = Config::default();
+        config.sandbox.enabled = true;
+        config.sandbox.level = crate::config::SandboxLevelConfig::Auto;
+        let caps = sandbox::SandboxCapabilities {
+            landlock_abi: None,
+            seccomp_available: false,
+            seatbelt_available: false,
+            level: sandbox::SandboxLevel::None,
+        };
+        let result = resolve_enforcement(&config, std::path::Path::new("/tmp"), &caps);
+        assert!(
+            matches!(result, SandboxEnforcement::FailClosed),
+            "sandbox.enabled = true + no kernel support should produce FailClosed"
+        );
+    }
+
+    #[test]
+    fn test_resolve_enforcement_returns_active_when_kernel_supports() {
+        let mut config = Config::default();
+        config.sandbox.enabled = true;
+        config.sandbox.level = crate::config::SandboxLevelConfig::Auto;
+        let caps = sandbox::SandboxCapabilities {
+            landlock_abi: Some(3),
+            seccomp_available: true,
+            seatbelt_available: false,
+            level: sandbox::SandboxLevel::Standard,
+        };
+        let result = resolve_enforcement(&config, std::path::Path::new("/tmp"), &caps);
+        assert!(
+            matches!(result, SandboxEnforcement::Active(_)),
+            "sandbox.enabled = true + kernel support should produce Active"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_enforcement_policy_extraction() {
+        // Active -> Some policy
+        let policy = sandbox::build_policy(
+            &crate::config::SandboxConfig::default(),
+            std::path::Path::new("/tmp"),
+            sandbox::SandboxLevel::Standard,
+        );
+        let active = SandboxEnforcement::Active(Arc::new(policy));
+        assert!(active.policy().is_some(), "Active should yield Some policy");
+
+        // FailClosed -> None
+        let fail = SandboxEnforcement::FailClosed;
+        assert!(fail.policy().is_none(), "FailClosed should yield None");
+
+        // Disabled -> None
+        let disabled = SandboxEnforcement::Disabled;
+        assert!(disabled.policy().is_none(), "Disabled should yield None");
     }
 }
