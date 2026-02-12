@@ -391,6 +391,25 @@ button:disabled {
     color: var(--fg-muted);
 }
 
+/* Egress status badges */
+.egress-badge {
+    display: inline-block;
+    padding: 0.125rem 0.375rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 500;
+}
+
+.egress-badge.external {
+    background: rgba(251, 191, 36, 0.2);
+    color: #fbbf24;
+}
+
+.egress-badge.local {
+    background: rgba(74, 222, 128, 0.2);
+    color: #4ade80;
+}
+
 /* Logs panel */
 .logs-panel {
     background: var(--bg-secondary);

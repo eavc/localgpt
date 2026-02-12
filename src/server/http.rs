@@ -556,16 +556,32 @@ struct StatusResponse {
     model: String,
     memory_chunks: usize,
     active_sessions: usize,
+    egress: EgressStatusResponse,
+}
+
+#[derive(Serialize)]
+struct EgressStatusResponse {
+    external_llm: bool,
+    external_embeddings: bool,
+    summary: String,
+    details: Vec<String>,
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let sessions = state.sessions.lock().await;
+    let egress = crate::config::egress::compute_egress_status(&state.config);
 
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         model: state.config.agent.default_model.clone(),
         memory_chunks: state.memory.chunk_count().unwrap_or(0),
         active_sessions: sessions.len(),
+        egress: EgressStatusResponse {
+            external_llm: egress.external_llm,
+            external_embeddings: egress.external_embeddings,
+            summary: egress.summary,
+            details: egress.details,
+        },
     })
 }
 
@@ -2065,6 +2081,107 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         std::fs::remove_file(legacy_path).ok();
+    }
+
+    /// Build a test app with the real `/api/status` handler and a custom config.
+    fn test_app_with_config(config: Config) -> (tempfile::TempDir, Router) {
+        let (tmpdir, memory) = MemoryManager::new_stub();
+        let state = Arc::new(AppState {
+            config,
+            sessions: Mutex::new(HashMap::new()),
+            memory,
+            turn_gate: TurnGate::new(),
+            workspace_lock: WorkspaceLock::new().unwrap(),
+            api_key: "test-key".to_string(),
+            rate_limiter: Mutex::new(RateLimiter::new()),
+        });
+
+        let app = Router::new()
+            .route("/api/status", get(status))
+            .with_state(state);
+
+        (tmpdir, app)
+    }
+
+    #[tokio::test]
+    async fn test_status_includes_egress_fields() {
+        let config = Config::default(); // claude-cli/opus, local embeddings
+        let (_tmpdir, app) = test_app_with_config(config);
+
+        let resp = app
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Egress object must exist
+        assert!(json.get("egress").is_some(), "status must include egress");
+        let egress = &json["egress"];
+        assert_eq!(egress["external_llm"], false);
+        assert_eq!(egress["external_embeddings"], false);
+        assert!(egress["summary"].as_str().unwrap().contains("local"));
+    }
+
+    #[tokio::test]
+    async fn test_status_egress_external_llm() {
+        let mut config = Config::default();
+        config.agent.default_model = "anthropic/claude-sonnet-4-5".to_string();
+        let (_tmpdir, app) = test_app_with_config(config);
+
+        let resp = app
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let egress = &json["egress"];
+        assert_eq!(egress["external_llm"], true);
+        assert_eq!(egress["external_embeddings"], false);
+        assert!(!egress["details"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_status_egress_external_embeddings() {
+        let mut config = Config::default();
+        config.memory.embedding_provider = "openai".to_string();
+        let (_tmpdir, app) = test_app_with_config(config);
+
+        let resp = app
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let egress = &json["egress"];
+        assert_eq!(egress["external_llm"], false);
+        assert_eq!(egress["external_embeddings"], true);
+    }
+
+    #[tokio::test]
+    async fn test_status_preserves_existing_fields() {
+        let config = Config::default();
+        let (_tmpdir, app) = test_app_with_config(config);
+
+        let resp = app
+            .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Original fields still present
+        assert!(json.get("version").is_some());
+        assert!(json.get("model").is_some());
+        assert!(json.get("memory_chunks").is_some());
+        assert!(json.get("active_sessions").is_some());
     }
 }
 

@@ -1,3 +1,4 @@
+pub mod egress;
 mod migrate;
 mod schema;
 

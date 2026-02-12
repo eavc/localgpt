@@ -451,6 +451,9 @@ function updateStatusPanel(status, heartbeat) {
     document.getElementById('status-model').textContent = status.model || '-';
     document.getElementById('status-sessions').textContent = status.active_sessions || '0';
 
+    // Update egress status
+    updateEgressStatus(status.egress);
+
     // Update heartbeat status
     const statusDot = document.getElementById('status-dot');
     const heartbeatStatusEl = document.getElementById('heartbeat-status');
@@ -515,6 +518,44 @@ function formatAge(seconds) {
     if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
     if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
     return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+// Egress status
+function updateEgressStatus(egress) {
+    const statusEl = document.getElementById('egress-status');
+    const summaryRow = document.getElementById('egress-summary-row');
+    const summaryEl = document.getElementById('egress-summary');
+    const detailsRow = document.getElementById('egress-details-row');
+    const detailsEl = document.getElementById('egress-details');
+
+    if (!egress) {
+        statusEl.innerHTML = '<span class="egress-badge local">Unknown</span>';
+        summaryRow.style.display = 'none';
+        detailsRow.style.display = 'none';
+        return;
+    }
+
+    const isExternal = egress.external_llm || egress.external_embeddings;
+
+    if (isExternal) {
+        statusEl.innerHTML = '<span class="egress-badge external">\u26A0 External</span>';
+    } else {
+        statusEl.innerHTML = '<span class="egress-badge local">\u2713 Local only</span>';
+    }
+
+    if (egress.summary) {
+        summaryRow.style.display = 'flex';
+        summaryEl.textContent = egress.summary;
+    } else {
+        summaryRow.style.display = 'none';
+    }
+
+    if (egress.details && egress.details.length > 0) {
+        detailsRow.style.display = 'flex';
+        detailsEl.textContent = egress.details.join(' ');
+    } else {
+        detailsRow.style.display = 'none';
+    }
 }
 
 // Logs panel functions

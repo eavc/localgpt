@@ -15,6 +15,7 @@ use crate::agent::{
     extract_tool_detail, list_sessions_for_agent, purge_expired_sessions, Agent, AgentConfig,
     ExecutionContext, ToolCall, ToolResult, DEFAULT_AGENT_ID,
 };
+use crate::config::egress::compute_egress_status;
 use crate::config::Config;
 use crate::memory::MemoryManager;
 
@@ -139,10 +140,12 @@ async fn worker_loop(
     agent.new_session().await?;
 
     // Send ready message
+    let egress = compute_egress_status(&config);
     let _ = tx.send(WorkerMessage::Ready {
         model: agent.model().to_string(),
         memory_chunks: agent.memory_chunk_count(),
         has_embeddings: agent.has_embeddings(),
+        egress,
     });
 
     // Send initial session list

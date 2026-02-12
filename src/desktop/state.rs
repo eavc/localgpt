@@ -1,6 +1,7 @@
 //! Application state shared between UI and worker
 
 use crate::agent::{SessionInfo, SessionStatus, ToolCall};
+use crate::config::egress::EgressStatus;
 
 /// Message from UI to worker
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub enum WorkerMessage {
         model: String,
         memory_chunks: usize,
         has_embeddings: bool,
+        egress: EgressStatus,
     },
     /// Streaming content chunk
     ContentChunk(String),
@@ -130,6 +132,8 @@ pub struct UiState {
     pub memory_chunks: usize,
     /// Whether embeddings are enabled
     pub has_embeddings: bool,
+    /// Data egress status
+    pub egress: Option<EgressStatus>,
     /// Session status
     pub status: Option<SessionStatus>,
     /// Which panel is active
@@ -158,10 +162,12 @@ impl UiState {
                 model,
                 memory_chunks,
                 has_embeddings,
+                egress,
             } => {
                 self.model = model;
                 self.memory_chunks = memory_chunks;
                 self.has_embeddings = has_embeddings;
+                self.egress = Some(egress);
                 self.is_loading = false;
             }
             WorkerMessage::ContentChunk(content) => {
@@ -257,5 +263,82 @@ impl UiState {
     /// Clear error
     pub fn clear_error(&mut self) {
         self.error = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_egress_external() -> EgressStatus {
+        EgressStatus {
+            external_llm: true,
+            external_embeddings: false,
+            summary: "External LLM provider is active.".to_string(),
+            details: vec![
+                "LLM model 'anthropic/claude-sonnet-4-5' routes to an external API.".to_string(),
+            ],
+        }
+    }
+
+    fn make_egress_local() -> EgressStatus {
+        EgressStatus {
+            external_llm: false,
+            external_embeddings: false,
+            summary: "All providers are local.".to_string(),
+            details: vec![],
+        }
+    }
+
+    #[test]
+    fn test_ready_message_sets_egress_state() {
+        let mut state = UiState::new();
+        assert!(state.egress.is_none());
+
+        state.handle_worker_message(WorkerMessage::Ready {
+            model: "claude-cli/opus".to_string(),
+            memory_chunks: 42,
+            has_embeddings: true,
+            egress: make_egress_local(),
+        });
+
+        let egress = state.egress.as_ref().expect("egress should be set");
+        assert!(!egress.external_llm);
+        assert!(!egress.external_embeddings);
+        assert!(egress.details.is_empty());
+    }
+
+    #[test]
+    fn test_ready_message_sets_external_egress() {
+        let mut state = UiState::new();
+
+        state.handle_worker_message(WorkerMessage::Ready {
+            model: "anthropic/claude-sonnet-4-5".to_string(),
+            memory_chunks: 10,
+            has_embeddings: false,
+            egress: make_egress_external(),
+        });
+
+        let egress = state.egress.as_ref().expect("egress should be set");
+        assert!(egress.external_llm);
+        assert!(!egress.external_embeddings);
+        assert_eq!(egress.details.len(), 1);
+    }
+
+    #[test]
+    fn test_ready_message_updates_model_and_chunks() {
+        let mut state = UiState::new();
+
+        state.handle_worker_message(WorkerMessage::Ready {
+            model: "ollama/llama3".to_string(),
+            memory_chunks: 99,
+            has_embeddings: false,
+            egress: make_egress_local(),
+        });
+
+        assert_eq!(state.model, "ollama/llama3");
+        assert_eq!(state.memory_chunks, 99);
+        assert!(!state.has_embeddings);
+        assert!(!state.is_loading);
     }
 }
