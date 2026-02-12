@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1178,8 +1178,9 @@ impl Tool for MemoryGetTool {
 
 // Web Fetch Tool
 pub struct WebFetchTool {
-    client: reqwest::Client,
     max_bytes: usize,
+    timeout: Duration,
+    connect_timeout: Duration,
 }
 
 /// Check whether an IP address is non-global (private, loopback, link-local,
@@ -1242,10 +1243,22 @@ fn is_ipv6_site_local(v6: &std::net::Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xFFC0) == 0xFEC0
 }
 
+/// A URL that has been validated for safe fetching, with the resolved IPs pinned
+/// to prevent DNS rebinding between validation and request.
+#[derive(Debug)]
+struct ValidatedUrl {
+    url: Url,
+    /// For domain-name hosts: all resolved public socket addresses (with port).
+    /// For IP-literal hosts: empty (no DNS resolution, so no rebinding risk).
+    /// Pinning the full set preserves availability/fallback while preventing rebinding.
+    pinned_addrs: Vec<SocketAddr>,
+}
+
 /// Validate a URL for safe fetching: scheme must be http/https, hostname must
 /// resolve to a public IP (no SSRF to localhost, private networks, or cloud
-/// metadata endpoints).
-async fn validate_fetch_url(url_str: &str) -> Result<Url> {
+/// metadata endpoints). Returns the validated URL together with a resolved
+/// socket address for DNS-pinning (prevents TOCTOU/rebinding attacks).
+async fn validate_fetch_url(url_str: &str) -> Result<ValidatedUrl> {
     let parsed = Url::parse(url_str).map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
 
     // Scheme validation
@@ -1262,21 +1275,28 @@ async fn validate_fetch_url(url_str: &str) -> Result<Url> {
         .host()
         .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
 
-    // Fast path: if the URL contains a literal IP, check it directly without DNS
+    // Fast path: if the URL contains a literal IP, check it directly without DNS.
+    // No pinning needed — there's no DNS resolution to rebind.
     match &host {
         url::Host::Ipv4(v4) => {
             let ip = IpAddr::V4(*v4);
             if is_private_ip(&ip) {
                 anyhow::bail!("Blocked request to private/internal address {}", ip);
             }
-            return Ok(parsed);
+            return Ok(ValidatedUrl {
+                url: parsed,
+                pinned_addrs: Vec::new(),
+            });
         }
         url::Host::Ipv6(v6) => {
             let ip = IpAddr::V6(*v6);
             if is_private_ip(&ip) {
                 anyhow::bail!("Blocked request to private/internal address {}", ip);
             }
-            return Ok(parsed);
+            return Ok(ValidatedUrl {
+                url: parsed,
+                pinned_addrs: Vec::new(),
+            });
         }
         url::Host::Domain(_) => {}
     }
@@ -1304,7 +1324,13 @@ async fn validate_fetch_url(url_str: &str) -> Result<Url> {
         }
     }
 
-    Ok(parsed)
+    // Pin all validated addresses to prevent DNS rebinding between
+    // this validation and the actual TCP connection. Pinning the full
+    // set lets reqwest fall back across addresses for availability.
+    Ok(ValidatedUrl {
+        url: parsed,
+        pinned_addrs: addrs,
+    })
 }
 
 /// Truncate a string at a safe UTF-8 boundary, returning at most `max_bytes` bytes.
@@ -1320,18 +1346,40 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Build a reqwest client for a single fetch hop, pinning DNS resolution
+/// to pre-validated IPs to prevent DNS rebinding attacks.
+fn build_fetch_client(
+    timeout: Duration,
+    connect_timeout: Duration,
+    validated: &ValidatedUrl,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none());
+
+    if !validated.pinned_addrs.is_empty() {
+        // Fail-closed: if we have pinned addresses but no host to bind them to,
+        // something is structurally wrong — refuse to build an unpinned client.
+        let host = validated.url.host_str().ok_or_else(|| {
+            anyhow::anyhow!("BUG: ValidatedUrl has pinned addresses but URL has no host")
+        })?;
+        builder = builder.resolve_to_addrs(host, &validated.pinned_addrs);
+    }
+
+    builder
+        .build()
+        .context("Failed to build web_fetch HTTP client")
+}
+
 impl WebFetchTool {
     pub fn new(max_bytes: usize, timeout_secs: u64) -> Result<Self> {
         let connect_secs = (timeout_secs / 3).max(5);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .connect_timeout(Duration::from_secs(connect_secs))
-            // Disable automatic redirects — we follow them manually so each
-            // redirect target is validated against the private-IP blocklist.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("Failed to build web_fetch HTTP client")?;
-        Ok(Self { client, max_bytes })
+        Ok(Self {
+            max_bytes,
+            timeout: Duration::from_secs(timeout_secs),
+            connect_timeout: Duration::from_secs(connect_secs),
+        })
     }
 }
 
@@ -1368,24 +1416,29 @@ impl Tool for WebFetchTool {
 
         debug!("web_fetch: validating URL: {}", url_str);
 
-        // Validate URL scheme and resolve hostname to reject private IPs
-        let validated = validate_fetch_url(url_str).await?;
+        // Validate URL scheme and resolve hostname to reject private IPs.
+        // Returns a ValidatedUrl with the resolved IP pinned for this hop.
+        let mut validated = validate_fetch_url(url_str).await?;
 
-        // Follow redirects manually (max 5), re-validating each target URL
-        // against the private-IP blocklist to prevent redirect-based SSRF.
+        // Follow redirects manually (max 5), re-validating AND re-pinning
+        // each target URL to prevent both redirect-based and DNS-rebinding SSRF.
         let max_redirects = 5;
-        let mut current_url = validated;
         let mut response = None;
 
         for redirect_count in 0..=max_redirects {
             debug!(
                 "web_fetch: fetching {} (hop {})",
-                current_url, redirect_count
+                validated.url, redirect_count
             );
 
-            let resp = self
-                .client
-                .get(current_url.as_str())
+            // Build a per-hop client with the validated IP pinned via
+            // reqwest::ClientBuilder::resolve(). This eliminates the DNS
+            // TOCTOU gap: reqwest connects directly to the pinned IP
+            // while preserving TLS SNI/hostname verification.
+            let client = build_fetch_client(self.timeout, self.connect_timeout, &validated)?;
+
+            let resp = client
+                .get(validated.url.as_str())
                 .header("User-Agent", "LocalGPT/0.1")
                 .send()
                 .await
@@ -1402,15 +1455,16 @@ impl Tool for WebFetchTool {
                     .ok_or_else(|| anyhow::anyhow!("Redirect with no Location header"))?;
 
                 // Resolve relative redirect URLs against the current URL
-                let next_url_str = current_url
+                let next_url_str = validated
+                    .url
                     .join(location)
                     .map_err(|e| anyhow::anyhow!("Invalid redirect URL '{}': {}", location, e))?
                     .to_string();
 
                 debug!("web_fetch: redirect to {}", next_url_str);
 
-                // Validate the redirect target (blocks private IPs, bad schemes)
-                current_url = validate_fetch_url(&next_url_str).await?;
+                // Re-validate AND re-pin the redirect target
+                validated = validate_fetch_url(&next_url_str).await?;
                 continue;
             }
 
@@ -2600,6 +2654,219 @@ mod tests {
         let metadata_target = "http://169.254.169.254/latest/meta-data/";
         let result = validate_fetch_url(metadata_target).await;
         assert!(result.is_err());
+    }
+
+    // --- SEC-18: DNS TOCTOU / rebinding prevention tests ---
+
+    #[tokio::test]
+    async fn test_validate_fetch_url_ip_literal_has_no_pinned_addrs() {
+        // IP literals don't need DNS pinning — there's no DNS resolution to rebind.
+        let result = validate_fetch_url("http://93.184.216.34/page")
+            .await
+            .unwrap();
+        assert!(
+            result.pinned_addrs.is_empty(),
+            "IP literal should not have pinned addresses"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_fetch_url_domain_has_pinned_addrs() {
+        // Domain names must produce pinned addresses to prevent DNS rebinding.
+        // Uses example.com which may fail if DNS is unavailable in CI — only
+        // tolerate resolution failures, not other error classes.
+        let result = validate_fetch_url("http://example.com/").await;
+        match result {
+            Ok(validated) => {
+                assert!(
+                    !validated.pinned_addrs.is_empty(),
+                    "Domain should have pinned addresses after validation"
+                );
+                for addr in &validated.pinned_addrs {
+                    assert!(
+                        !is_private_ip(&addr.ip()),
+                        "All pinned addresses should be public, got {}",
+                        addr.ip()
+                    );
+                    assert_eq!(addr.port(), 80, "HTTP default port should be 80");
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("resolve") || msg.contains("DNS") || msg.contains("lookup"),
+                    "Only DNS/network errors should be tolerated, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_fetch_url_https_domain_pins_correct_port() {
+        let result = validate_fetch_url("https://example.com/").await;
+        match result {
+            Ok(validated) => {
+                assert!(!validated.pinned_addrs.is_empty());
+                for addr in &validated.pinned_addrs {
+                    assert_eq!(addr.port(), 443, "HTTPS default port should be 443");
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("resolve") || msg.contains("DNS") || msg.contains("lookup"),
+                    "Only DNS/network errors should be tolerated, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Verify that a per-hop client pinned via `build_fetch_client` connects
+    /// to the pinned IP instead of performing its own DNS resolution.
+    #[tokio::test]
+    async fn test_build_fetch_client_pins_domain_to_addr() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Build a client that pins "pinned-test.example.com" to our mock server.
+        // Without pinning, this domain wouldn't resolve (or resolve elsewhere).
+        let validated = ValidatedUrl {
+            url: Url::parse(&format!(
+                "http://pinned-test.example.com:{}/ping",
+                addr.port()
+            ))
+            .unwrap(),
+            pinned_addrs: vec![addr],
+        };
+
+        let client =
+            build_fetch_client(Duration::from_secs(5), Duration::from_secs(5), &validated).unwrap();
+
+        let resp = client
+            .get(validated.url.as_str())
+            .send()
+            .await
+            .expect("Pinned client should connect to mock server");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "pong",
+            "Request should reach the pinned mock server"
+        );
+    }
+
+    /// Verify that `build_fetch_client` without pinning (IP literal) still works.
+    #[tokio::test]
+    async fn test_build_fetch_client_no_pin_for_ip_literal() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // IP literal: no pinning needed
+        let validated = ValidatedUrl {
+            url: Url::parse(&format!("http://127.0.0.1:{}/ping", addr.port())).unwrap(),
+            pinned_addrs: Vec::new(),
+        };
+
+        let client =
+            build_fetch_client(Duration::from_secs(5), Duration::from_secs(5), &validated).unwrap();
+
+        let resp = client.get(validated.url.as_str()).send().await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "pong");
+    }
+
+    /// Defense-in-depth: verify `build_fetch_client` fails closed when a
+    /// `ValidatedUrl` has pinned addresses but no host (structurally unreachable
+    /// via `validate_fetch_url`, but the guard must hold if the invariant breaks).
+    #[test]
+    fn test_build_fetch_client_rejects_pinned_addrs_without_host() {
+        let addr: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let validated = ValidatedUrl {
+            // data: URLs have no host — triggers the fail-closed guard
+            url: Url::parse("data:text/html,hello").unwrap(),
+            pinned_addrs: vec![addr],
+        };
+        let result = build_fetch_client(Duration::from_secs(5), Duration::from_secs(5), &validated);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("BUG"));
+    }
+
+    /// Exercises the actual redirect-handling flow: a pinned client follows a
+    /// redirect, then the redirect target is re-validated (and re-pinned).
+    /// This tests the full sequence: build_fetch_client → request → redirect
+    /// response → validate_fetch_url on the target → rejection.
+    #[tokio::test]
+    async fn test_redirect_repins_via_pinned_client_flow() {
+        use axum::{routing::get, Router};
+
+        // Mock server redirects to a private IP.
+        let app = Router::new().route(
+            "/hop1",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "http://10.0.0.1/secret")],
+                    "",
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Step 1: Simulate what validate_fetch_url returns for a domain
+        // by constructing a ValidatedUrl pinned to the mock server.
+        let validated = ValidatedUrl {
+            url: Url::parse(&format!(
+                "http://pinned-redirect-test.example.com:{}/hop1",
+                addr.port()
+            ))
+            .unwrap(),
+            pinned_addrs: vec![addr],
+        };
+
+        // Step 2: Build a pinned client and make the request (same as execute loop).
+        let client =
+            build_fetch_client(Duration::from_secs(5), Duration::from_secs(5), &validated).unwrap();
+        let resp = client
+            .get(validated.url.as_str())
+            .header("User-Agent", "LocalGPT/0.1")
+            .send()
+            .await
+            .expect("Pinned client should reach mock server");
+
+        // Step 3: Follow the redirect — extract Location header.
+        assert!(resp.status().is_redirection(), "Should get a redirect");
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let next_url = validated.url.join(location).unwrap().to_string();
+        assert_eq!(next_url, "http://10.0.0.1/secret");
+
+        // Step 4: Re-validate the redirect target — this is where the
+        // redirect loop would re-pin. Must reject the private IP.
+        let result = validate_fetch_url(&next_url).await;
+        assert!(
+            result.is_err(),
+            "Redirect to private IP must be blocked during re-validation"
+        );
+        assert!(result.unwrap_err().to_string().contains("private"));
     }
 
     // --- SEC-16: SandboxEnforcement fail-closed tests ---
