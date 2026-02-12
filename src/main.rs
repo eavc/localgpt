@@ -6,6 +6,14 @@ mod cli;
 use cli::{Cli, Commands};
 
 fn main() -> Result<()> {
+    // argv[0] dispatch: if re-exec'd as "localgpt-sandbox", enter sandbox child path
+    // immediately — before Tokio, Clap, or any other initialization.
+    if let Some(arg0) = std::env::args_os().next() {
+        if arg0.to_string_lossy().ends_with("localgpt-sandbox") {
+            localgpt::sandbox::sandbox_child_main();
+        }
+    }
+
     let cli = Cli::parse();
 
     // Handle daemon start/restart specially - must fork BEFORE starting Tokio runtime
@@ -50,5 +58,6 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Daemon(args) => cli::daemon::run(args, &cli.agent).await,
         Commands::Memory(args) => cli::memory::run(args, &cli.agent).await,
         Commands::Config(args) => cli::config::run(args).await,
+        Commands::Sandbox(args) => cli::sandbox::run(args).await,
     }
 }

@@ -35,6 +35,9 @@ pub struct Config {
 
     #[serde(default)]
     pub session: SessionConfig,
+
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +290,136 @@ pub struct SessionConfig {
     pub retention_days: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Enable shell command sandboxing (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Sandbox enforcement level
+    #[serde(default)]
+    pub level: SandboxLevelConfig,
+
+    /// Command timeout in seconds (default: 120)
+    #[serde(default = "default_sandbox_timeout")]
+    pub timeout_secs: u64,
+
+    /// Maximum output bytes (default: 1MB)
+    #[serde(default = "default_sandbox_max_output")]
+    pub max_output_bytes: u64,
+
+    /// Maximum file size in bytes (RLIMIT_FSIZE, default: 50MB)
+    #[serde(default = "default_sandbox_max_file_size")]
+    pub max_file_size_bytes: u64,
+
+    /// Maximum child processes (RLIMIT_NPROC, default: 64)
+    #[serde(default = "default_sandbox_max_processes")]
+    pub max_processes: u32,
+
+    /// Additional path allowances
+    #[serde(default)]
+    pub allow_paths: AllowPathsConfig,
+
+    /// Network policy
+    #[serde(default)]
+    pub network: SandboxNetworkConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AllowPathsConfig {
+    /// Additional read-only paths
+    #[serde(default)]
+    pub read: Vec<String>,
+
+    /// Additional writable paths
+    #[serde(default)]
+    pub write: Vec<String>,
+}
+
+/// Sandbox enforcement level config setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxLevelConfig {
+    /// Use highest available level
+    #[default]
+    Auto,
+    /// Landlock V4+ + seccomp + userns
+    Full,
+    /// Landlock V1+ + seccomp
+    Standard,
+    /// seccomp only (network blocking)
+    Minimal,
+    /// No kernel enforcement
+    None,
+}
+
+impl std::fmt::Display for SandboxLevelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Full => write!(f, "full"),
+            Self::Standard => write!(f, "standard"),
+            Self::Minimal => write!(f, "minimal"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+impl std::str::FromStr for SandboxLevelConfig {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "full" => Ok(Self::Full),
+            "standard" => Ok(Self::Standard),
+            "minimal" => Ok(Self::Minimal),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "Invalid sandbox level: {:?}. Valid values: auto, full, standard, minimal, none",
+                other
+            )),
+        }
+    }
+}
+
+/// Sandbox network policy config setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxNetworkPolicyConfig {
+    #[default]
+    Deny,
+}
+
+impl std::fmt::Display for SandboxNetworkPolicyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deny => write!(f, "deny"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxNetworkConfig {
+    /// Network policy
+    #[serde(default)]
+    pub policy: SandboxNetworkPolicyConfig,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            level: SandboxLevelConfig::default(),
+            timeout_secs: default_sandbox_timeout(),
+            max_output_bytes: default_sandbox_max_output(),
+            max_file_size_bytes: default_sandbox_max_file_size(),
+            max_processes: default_sandbox_max_processes(),
+            allow_paths: AllowPathsConfig::default(),
+            network: SandboxNetworkConfig::default(),
+        }
+    }
+}
+
 // Default value functions
 fn default_model() -> String {
     // Default to Claude CLI (uses existing Claude Code auth, no API key needed)
@@ -381,6 +514,18 @@ fn default_log_level() -> String {
 }
 fn default_log_file() -> String {
     "~/.localgpt/logs/agent.log".to_string()
+}
+fn default_sandbox_timeout() -> u64 {
+    120
+}
+fn default_sandbox_max_output() -> u64 {
+    1_048_576 // 1MB
+}
+fn default_sandbox_max_file_size() -> u64 {
+    52_428_800 // 50MB
+}
+fn default_sandbox_max_processes() -> u32 {
+    64
 }
 
 impl Default for AgentConfig {
@@ -583,6 +728,12 @@ impl Config {
             ["logging", "level"] => Ok(self.logging.level.clone()),
             ["logging", "log_llm_bodies"] => Ok(self.logging.log_llm_bodies.to_string()),
             ["session", "retention_days"] => Ok(self.session.retention_days.to_string()),
+            ["sandbox", "enabled"] => Ok(self.sandbox.enabled.to_string()),
+            ["sandbox", "level"] => Ok(self.sandbox.level.to_string()),
+            ["sandbox", "timeout_secs"] => Ok(self.sandbox.timeout_secs.to_string()),
+            ["sandbox", "max_output_bytes"] => Ok(self.sandbox.max_output_bytes.to_string()),
+            ["sandbox", "max_file_size_bytes"] => Ok(self.sandbox.max_file_size_bytes.to_string()),
+            ["sandbox", "max_processes"] => Ok(self.sandbox.max_processes.to_string()),
             _ => anyhow::bail!("Unknown config key: {}", key),
         }
     }
@@ -607,6 +758,16 @@ impl Config {
             ["logging", "level"] => self.logging.level = value.to_string(),
             ["logging", "log_llm_bodies"] => self.logging.log_llm_bodies = value.parse()?,
             ["session", "retention_days"] => self.session.retention_days = value.parse()?,
+            ["sandbox", "enabled"] => self.sandbox.enabled = value.parse()?,
+            ["sandbox", "level"] => {
+                self.sandbox.level = value.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
+            ["sandbox", "timeout_secs"] => self.sandbox.timeout_secs = value.parse()?,
+            ["sandbox", "max_output_bytes"] => self.sandbox.max_output_bytes = value.parse()?,
+            ["sandbox", "max_file_size_bytes"] => {
+                self.sandbox.max_file_size_bytes = value.parse()?
+            }
+            ["sandbox", "max_processes"] => self.sandbox.max_processes = value.parse()?,
             _ => anyhow::bail!("Unknown config key: {}", key),
         }
 
@@ -759,4 +920,18 @@ level = "info"
 # Log full LLM request/response bodies at TRACE level (default: false).
 # WARNING: Bodies may contain sensitive conversation content.
 # log_llm_bodies = false
+
+# Shell sandbox (kernel-enforced isolation for LLM-generated commands)
+# [sandbox]
+# enabled = true                        # default: true
+# level = "auto"                        # auto | full | standard | minimal | none
+# timeout_secs = 120                    # default: 120
+# max_output_bytes = 1048576            # default: 1MB
+#
+# [sandbox.allow_paths]
+# read = ["/data/datasets"]             # additional read-only paths
+# write = ["/tmp/builds"]               # additional writable paths
+#
+# [sandbox.network]
+# policy = "deny"                       # deny | proxy
 "#;

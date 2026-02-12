@@ -1213,6 +1213,8 @@ mod tests {
             endpoint: "http://localhost:11434".to_string(),
             model: "test".to_string(),
         });
+        // Disable sandbox in tests — no localgpt-sandbox binary available
+        config.sandbox.enabled = false;
         let (tmpdir, memory) = MemoryManager::new_stub();
         let agent_config = AgentConfig {
             model: "ollama/test".to_string(),

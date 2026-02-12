@@ -183,6 +183,39 @@ bind = "127.0.0.1"
 # retention period if your conversations may contain credentials,
 # personal data, or other sensitive material.
 
+[sandbox]
+# Kernel-enforced shell sandboxing for bash tool execution.
+# Uses Landlock LSM + seccomp-bpf on Linux, Seatbelt on macOS.
+# enabled = true
+
+# Sandbox enforcement level: "full", "standard", "minimal", "none", or "auto" (default).
+# "auto" detects kernel capabilities and applies the strongest available level.
+# "full" requires Landlock V4+ and seccomp; "standard" requires Landlock + seccomp;
+# "minimal" requires seccomp only (network blocking); "none" disables enforcement.
+# level = "auto"
+
+# Timeout in seconds for sandboxed shell commands. Default: 120
+# timeout_secs = 120
+
+# Maximum output bytes captured from sandboxed commands. Default: 1048576 (1MB)
+# max_output_bytes = 1048576
+
+# Maximum file size (bytes) a sandboxed command may create. Default: 52428800 (50MB)
+# max_file_size_bytes = 52428800
+
+# Maximum child processes inside sandbox. Default: 64
+# max_processes = 64
+
+# Additional paths the sandbox may read (beyond workspace and system paths).
+# [sandbox.allow_paths]
+# read = ["/usr/share/dict"]
+# write = ["/tmp/localgpt-scratch"]
+
+# Network policy inside the sandbox: "deny" (default).
+# Network access is blocked via seccomp-bpf on Linux / Seatbelt on macOS.
+# [sandbox.network]
+# policy = "deny"
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

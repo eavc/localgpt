@@ -96,8 +96,15 @@ eframe = { version = "0.30", optional = true, default-features = false, features
 # Unix daemonization (optional, only for daemon mode)
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5"
+# Sandbox (process isolation — rlimits, argv[0] re-exec)
+nix = { version = "0.29", features = ["process", "resource", "signal"] }
 sha2 = "0.10"
 rustyline = "17.0.2"
+
+# Linux sandbox (Landlock + seccomp)
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.4"
 
 [dev-dependencies]
 tempfile = "3.14"

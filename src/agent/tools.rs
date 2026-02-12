@@ -13,6 +13,7 @@ use url::Url;
 use super::providers::ToolSchema;
 use crate::config::Config;
 use crate::memory::MemoryManager;
+use crate::sandbox::{self, SandboxPolicy};
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -235,6 +236,9 @@ pub fn create_default_tools(
     let workspace = config.workspace_path();
     let sandbox = Arc::new(PathSandbox::new(&workspace, &config.tools.allowed_paths));
 
+    // Build sandbox policy if enabled
+    let sandbox_policy = build_sandbox_policy(config, &workspace);
+
     // Use indexed memory search if MemoryManager is provided, otherwise fallback to grep-based
     let memory_search_tool: Box<dyn Tool> = if let Some(ref mem) = memory {
         Box::new(MemorySearchToolWithIndex::new(Arc::clone(mem)))
@@ -243,10 +247,22 @@ pub fn create_default_tools(
     };
 
     Ok(vec![
-        Box::new(BashTool::new(config.tools.bash_timeout_ms)),
-        Box::new(ReadFileTool::new(Arc::clone(&sandbox))),
-        Box::new(WriteFileTool::new(Arc::clone(&sandbox))),
-        Box::new(EditFileTool::new(Arc::clone(&sandbox))),
+        Box::new(BashTool::new(
+            config.tools.bash_timeout_ms,
+            sandbox_policy.as_ref().map(Arc::clone),
+        )),
+        Box::new(ReadFileTool::new(
+            Arc::clone(&sandbox),
+            sandbox_policy.as_ref().map(Arc::clone),
+        )),
+        Box::new(WriteFileTool::new(
+            Arc::clone(&sandbox),
+            sandbox_policy.as_ref().map(Arc::clone),
+        )),
+        Box::new(EditFileTool::new(
+            Arc::clone(&sandbox),
+            sandbox_policy.as_ref().map(Arc::clone),
+        )),
         memory_search_tool,
         Box::new(MemoryGetTool::new(workspace)),
         Box::new(WebFetchTool::new(
@@ -254,6 +270,34 @@ pub fn create_default_tools(
             config.tools.web_fetch_timeout_secs,
         )?),
     ])
+}
+
+/// Build a sandbox policy from config if sandbox is enabled and platform supports it.
+/// Returns an `Arc` so the policy can be shared across tools without deep-cloning path vectors.
+fn build_sandbox_policy(
+    config: &Config,
+    workspace: &std::path::Path,
+) -> Option<Arc<SandboxPolicy>> {
+    if config.sandbox.enabled {
+        let caps = sandbox::detect_capabilities();
+        let effective = caps.effective_level(config.sandbox.level);
+        if effective > sandbox::SandboxLevel::None {
+            Some(Arc::new(sandbox::build_policy(
+                &config.sandbox,
+                workspace,
+                effective,
+            )))
+        } else {
+            tracing::warn!(
+                "Sandbox enabled but no kernel support detected (level: {:?}). \
+                 Commands will run without sandbox enforcement.",
+                caps.level
+            );
+            None
+        }
+    } else {
+        None
+    }
 }
 
 /// Known tool names for validation of `heartbeat.allowed_tools` entries.
@@ -287,6 +331,9 @@ pub fn create_heartbeat_tools(
     // Use a restricted sandbox — only HEARTBEAT.md, MEMORY.md, and memory/
     let sandbox = Arc::new(PathSandbox::new_heartbeat(&workspace));
 
+    // Build sandbox policy for heartbeat too (shell commands are highest-risk surface)
+    let sandbox_policy = build_sandbox_policy(config, &workspace);
+
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -295,9 +342,18 @@ pub fn create_heartbeat_tools(
             continue; // skip duplicate entries
         }
         match name.as_str() {
-            "read_file" => tools.push(Box::new(ReadFileTool::new(Arc::clone(&sandbox)))),
-            "write_file" => tools.push(Box::new(WriteFileTool::new(Arc::clone(&sandbox)))),
-            "edit_file" => tools.push(Box::new(EditFileTool::new(Arc::clone(&sandbox)))),
+            "read_file" => tools.push(Box::new(ReadFileTool::new(
+                Arc::clone(&sandbox),
+                sandbox_policy.as_ref().map(Arc::clone),
+            ))),
+            "write_file" => tools.push(Box::new(WriteFileTool::new(
+                Arc::clone(&sandbox),
+                sandbox_policy.as_ref().map(Arc::clone),
+            ))),
+            "edit_file" => tools.push(Box::new(EditFileTool::new(
+                Arc::clone(&sandbox),
+                sandbox_policy.as_ref().map(Arc::clone),
+            ))),
             "memory_search" => {
                 let tool: Box<dyn Tool> = if let Some(ref mem) = memory {
                     Box::new(MemorySearchToolWithIndex::new(Arc::clone(mem)))
@@ -307,7 +363,10 @@ pub fn create_heartbeat_tools(
                 tools.push(tool);
             }
             "memory_get" => tools.push(Box::new(MemoryGetTool::new(workspace.clone()))),
-            "bash" => tools.push(Box::new(BashTool::new(config.tools.bash_timeout_ms))),
+            "bash" => tools.push(Box::new(BashTool::new(
+                config.tools.bash_timeout_ms,
+                sandbox_policy.as_ref().map(Arc::clone),
+            ))),
             "web_fetch" => {
                 tools.push(Box::new(WebFetchTool::new(
                     config.tools.web_fetch_max_bytes,
@@ -337,11 +396,15 @@ pub fn create_heartbeat_tools(
 // Bash Tool
 pub struct BashTool {
     default_timeout_ms: u64,
+    sandbox_policy: Option<Arc<SandboxPolicy>>,
 }
 
 impl BashTool {
-    pub fn new(default_timeout_ms: u64) -> Self {
-        Self { default_timeout_ms }
+    pub fn new(default_timeout_ms: u64, sandbox_policy: Option<Arc<SandboxPolicy>>) -> Self {
+        Self {
+            default_timeout_ms,
+            sandbox_policy,
+        }
     }
 }
 
@@ -387,7 +450,18 @@ impl Tool for BashTool {
             timeout_ms, command
         );
 
-        // Run command with timeout
+        // Use sandbox if policy is configured
+        if let Some(ref policy) = self.sandbox_policy {
+            let (output, exit_code) = sandbox::run_sandboxed(command, policy, timeout_ms).await?;
+
+            if output.is_empty() {
+                return Ok(format!("Command completed with exit code: {}", exit_code));
+            }
+
+            return Ok(output);
+        }
+
+        // Fallback: run command directly without sandbox
         let timeout_duration = std::time::Duration::from_millis(timeout_ms);
         let output = tokio::time::timeout(
             timeout_duration,
@@ -429,11 +503,15 @@ impl Tool for BashTool {
 // Read File Tool
 pub struct ReadFileTool {
     sandbox: Arc<PathSandbox>,
+    sandbox_policy: Option<Arc<SandboxPolicy>>,
 }
 
 impl ReadFileTool {
-    pub fn new(sandbox: Arc<PathSandbox>) -> Self {
-        Self { sandbox }
+    pub fn new(sandbox: Arc<PathSandbox>, sandbox_policy: Option<Arc<SandboxPolicy>>) -> Self {
+        Self {
+            sandbox,
+            sandbox_policy,
+        }
     }
 }
 
@@ -474,7 +552,19 @@ impl Tool for ReadFileTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing path"))?;
 
+        // Validate and canonicalize path first via PathSandbox
         let path = self.sandbox.validate(raw_path, true)?;
+
+        // Check credential directory deny list on canonical path
+        if let Some(ref policy) = self.sandbox_policy {
+            if sandbox::policy::is_path_denied(&path, policy) {
+                anyhow::bail!(
+                    "Cannot read file in denied directory: {}. \
+                     This path is blocked by sandbox policy.",
+                    path.display()
+                );
+            }
+        }
 
         debug!("Reading file: {}", path.display());
 
@@ -505,11 +595,15 @@ impl Tool for ReadFileTool {
 // Write File Tool
 pub struct WriteFileTool {
     sandbox: Arc<PathSandbox>,
+    sandbox_policy: Option<Arc<SandboxPolicy>>,
 }
 
 impl WriteFileTool {
-    pub fn new(sandbox: Arc<PathSandbox>) -> Self {
-        Self { sandbox }
+    pub fn new(sandbox: Arc<PathSandbox>, sandbox_policy: Option<Arc<SandboxPolicy>>) -> Self {
+        Self {
+            sandbox,
+            sandbox_policy,
+        }
     }
 }
 
@@ -550,8 +644,19 @@ impl Tool for WriteFileTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing content"))?;
 
-        // Validate path — file may not exist yet, so must_exist=false
+        // Validate and canonicalize path first via PathSandbox (file may not exist yet)
         let path = self.sandbox.validate(raw_path, false)?;
+
+        // Check credential directory deny list on canonical path
+        if let Some(ref policy) = self.sandbox_policy {
+            if sandbox::policy::is_path_denied(&path, policy) {
+                anyhow::bail!(
+                    "Cannot write to denied directory: {}. \
+                     This path is blocked by sandbox policy.",
+                    path.display()
+                );
+            }
+        }
 
         debug!("Writing file: {}", path.display());
 
@@ -573,11 +678,15 @@ impl Tool for WriteFileTool {
 // Edit File Tool
 pub struct EditFileTool {
     sandbox: Arc<PathSandbox>,
+    sandbox_policy: Option<Arc<SandboxPolicy>>,
 }
 
 impl EditFileTool {
-    pub fn new(sandbox: Arc<PathSandbox>) -> Self {
-        Self { sandbox }
+    pub fn new(sandbox: Arc<PathSandbox>, sandbox_policy: Option<Arc<SandboxPolicy>>) -> Self {
+        Self {
+            sandbox,
+            sandbox_policy,
+        }
     }
 }
 
@@ -630,7 +739,19 @@ impl Tool for EditFileTool {
             .ok_or_else(|| anyhow::anyhow!("Missing new_string"))?;
         let replace_all = args["replace_all"].as_bool().unwrap_or(false);
 
+        // Validate and canonicalize path first via PathSandbox
         let path = self.sandbox.validate(raw_path, true)?;
+
+        // Check credential directory deny list on canonical path
+        if let Some(ref policy) = self.sandbox_policy {
+            if sandbox::policy::is_path_denied(&path, policy) {
+                anyhow::bail!(
+                    "Cannot edit file in denied directory: {}. \
+                     This path is blocked by sandbox policy.",
+                    path.display()
+                );
+            }
+        }
 
         debug!("Editing file: {}", path.display());
 
@@ -1528,7 +1649,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_tool_denies_outside_workspace() {
         let (_workspace, sandbox) = setup_sandbox();
-        let tool = ReadFileTool::new(Arc::new(sandbox));
+        let tool = ReadFileTool::new(Arc::new(sandbox), None);
 
         let args = serde_json::json!({"path": "/etc/passwd"}).to_string();
         let result = tool.execute(&args).await;
@@ -1542,7 +1663,7 @@ mod tests {
         let file = workspace.path().join("hello.txt");
         fs::write(&file, "world").unwrap();
 
-        let tool = ReadFileTool::new(Arc::new(sandbox));
+        let tool = ReadFileTool::new(Arc::new(sandbox), None);
         let args = serde_json::json!({"path": file.to_str().unwrap()}).to_string();
         let result = tool.execute(&args).await;
         assert!(result.is_ok());
@@ -1552,7 +1673,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_file_tool_denies_outside_workspace() {
         let (_workspace, sandbox) = setup_sandbox();
-        let tool = WriteFileTool::new(Arc::new(sandbox));
+        let tool = WriteFileTool::new(Arc::new(sandbox), None);
 
         let args =
             serde_json::json!({"path": "/tmp/evil_write_test.txt", "content": "pwned"}).to_string();
@@ -1564,7 +1685,7 @@ mod tests {
     #[tokio::test]
     async fn test_edit_file_tool_denies_outside_workspace() {
         let (_workspace, sandbox) = setup_sandbox();
-        let tool = EditFileTool::new(Arc::new(sandbox));
+        let tool = EditFileTool::new(Arc::new(sandbox), None);
 
         let args = serde_json::json!({
             "path": "/etc/hosts",
@@ -1820,7 +1941,7 @@ mod tests {
     #[tokio::test]
     async fn test_heartbeat_read_file_tool_allows_heartbeat_md() {
         let (workspace, sandbox) = setup_heartbeat_sandbox();
-        let tool = ReadFileTool::new(Arc::new(sandbox));
+        let tool = ReadFileTool::new(Arc::new(sandbox), None);
         let path = workspace.path().join("HEARTBEAT.md");
         let args = serde_json::json!({"path": path.to_str().unwrap()}).to_string();
         let result = tool.execute(&args).await;
@@ -1831,7 +1952,7 @@ mod tests {
     #[tokio::test]
     async fn test_heartbeat_read_file_tool_denies_other_workspace_files() {
         let (workspace, sandbox) = setup_heartbeat_sandbox();
-        let tool = ReadFileTool::new(Arc::new(sandbox));
+        let tool = ReadFileTool::new(Arc::new(sandbox), None);
         let path = workspace.path().join("IDENTITY.md");
         let args = serde_json::json!({"path": path.to_str().unwrap()}).to_string();
         let result = tool.execute(&args).await;
