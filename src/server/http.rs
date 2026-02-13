@@ -54,6 +54,12 @@ const MAX_SESSIONS: usize = 100;
 /// Agent ID for HTTP sessions
 const HTTP_AGENT_ID: &str = "http";
 
+/// Auth session cookie name
+const AUTH_SESSION_COOKIE: &str = "lgpt_session";
+
+/// Maximum number of auth sessions before eviction
+const MAX_AUTH_SESSIONS: usize = 1000;
+
 pub struct Server {
     config: Config,
     turn_gate: TurnGate,
@@ -64,6 +70,11 @@ struct SessionEntry {
     last_accessed: Instant,
     /// Whether session has unsaved changes
     dirty: bool,
+}
+
+/// An auth session issued via cookie when the web UI is loaded.
+struct AuthSession {
+    last_used: Instant,
 }
 
 struct AppState {
@@ -79,6 +90,8 @@ struct AppState {
     api_key: String,
     /// Rate limiter for API routes
     rate_limiter: Mutex<RateLimiter>,
+    /// Cookie-based auth sessions for the web UI
+    auth_sessions: Mutex<HashMap<String, AuthSession>>,
 }
 
 struct RateLimiter {
@@ -136,27 +149,13 @@ async fn enforce_rate_limit(
     next.run(request).await
 }
 
-/// Auth middleware: validates API key via bearer token or same-origin bypass.
+/// Auth middleware: validates API key via bearer token or session cookie.
 async fn require_api_key(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
-    // 1. Same-origin bypass: allow requests from the embedded UI.
-    //    Sec-Fetch-Site is a browser-enforced forbidden header (cannot be spoofed by JS).
-    //    Only trust it when bound to loopback to prevent network-level spoofing.
-    let bind = &state.config.server.bind;
-    if is_loopback_bind(bind) {
-        if let Some(fetch_site) = request.headers().get("sec-fetch-site") {
-            if let Ok(value) = fetch_site.to_str() {
-                if value == "same-origin" {
-                    return next.run(request).await;
-                }
-            }
-        }
-    }
-
-    // 2. Bearer token auth (case-insensitive scheme per RFC 7235)
+    // 1. Bearer token auth (case-insensitive scheme per RFC 7235)
     if let Some(auth_header) = request.headers().get(header::AUTHORIZATION) {
         if let Ok(value) = auth_header.to_str() {
             let parts: Vec<&str> = value.splitn(2, ' ').collect();
@@ -167,7 +166,33 @@ async fn require_api_key(
                 return next.run(request).await;
             }
         }
-        // Invalid auth header — fall through to 401
+        // Invalid auth header — fall through to cookie check
+    }
+
+    // 2. Session cookie auth (only on loopback — cookies are issued when the
+    //    web UI page is loaded, and restricted to loopback to prevent
+    //    unauthenticated access on network-exposed binds)
+    if is_loopback_bind(&state.config.server.bind) {
+        if let Some(token) = extract_session_cookie(request.headers()) {
+            let ttl = Duration::from_secs(state.config.server.session_ttl_secs);
+            let valid = {
+                let mut sessions = state.auth_sessions.lock().await;
+                if let Some(session) = sessions.get_mut(token) {
+                    if session.last_used.elapsed() < ttl {
+                        session.last_used = Instant::now();
+                        true
+                    } else {
+                        sessions.remove(token);
+                        false
+                    }
+                } else {
+                    false
+                }
+            }; // lock dropped before downstream work
+            if valid {
+                return next.run(request).await;
+            }
+        }
     }
 
     // 3. Reject
@@ -177,6 +202,20 @@ async fn require_api_key(
         "Unauthorized: provide a valid API key via Authorization: Bearer <key> header",
     )
         .into_response()
+}
+
+/// Extract the `lgpt_session` cookie value from request headers.
+fn extract_session_cookie(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in cookie_header.split(';') {
+        let part = part.trim();
+        if let Some((key, value)) = part.split_once('=') {
+            if key == AUTH_SESSION_COOKIE && !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
 }
 
 impl Server {
@@ -211,6 +250,7 @@ impl Server {
             workspace_lock,
             api_key: self.config.server.api_key.clone(),
             rate_limiter: Mutex::new(RateLimiter::new()),
+            auth_sessions: Mutex::new(HashMap::new()),
         });
 
         // Purge expired session files on startup
@@ -226,13 +266,14 @@ impl Server {
             info!("Could not load persisted sessions: {}", e);
         }
 
-        // Spawn session cleanup task
+        // Spawn session cleanup task (agent sessions + auth sessions)
         let cleanup_state = state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 cleanup_expired_sessions(&cleanup_state).await;
+                cleanup_expired_auth_sessions(&cleanup_state).await;
             }
         });
 
@@ -377,6 +418,18 @@ async fn cleanup_expired_sessions(state: &Arc<AppState>) {
     }
 }
 
+// Auth session cleanup task
+async fn cleanup_expired_auth_sessions(state: &Arc<AppState>) {
+    let ttl = Duration::from_secs(state.config.server.session_ttl_secs);
+    let mut sessions = state.auth_sessions.lock().await;
+    let before = sessions.len();
+    sessions.retain(|_, s| s.last_used.elapsed() < ttl);
+    let removed = before - sessions.len();
+    if removed > 0 {
+        debug!("Cleaned up {} expired auth sessions", removed);
+    }
+}
+
 // Load persisted sessions from disk
 async fn load_persisted_sessions(state: &Arc<AppState>) -> Result<(), anyhow::Error> {
     use crate::agent::list_sessions_for_agent;
@@ -513,9 +566,47 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
-// Serve UI index.html at root
-async fn serve_ui_index() -> Response {
-    serve_ui_asset("index.html")
+// Serve UI index.html at root, issuing an auth session cookie on loopback
+async fn serve_ui_index(State(state): State<Arc<AppState>>) -> Response {
+    let mut response = serve_ui_asset("index.html");
+
+    // Only issue session cookies when bound to loopback — on non-loopback
+    // binds the UI requires explicit Bearer auth to prevent unauthenticated
+    // network access.
+    if is_loopback_bind(&state.config.server.bind) {
+        let token = uuid::Uuid::new_v4().to_string();
+        {
+            let mut sessions = state.auth_sessions.lock().await;
+
+            // Evict oldest session if at capacity
+            if sessions.len() >= MAX_AUTH_SESSIONS {
+                if let Some(oldest_key) = sessions
+                    .iter()
+                    .min_by_key(|(_, s)| s.last_used)
+                    .map(|(k, _)| k.clone())
+                {
+                    sessions.remove(&oldest_key);
+                }
+            }
+
+            sessions.insert(
+                token.clone(),
+                AuthSession {
+                    last_used: Instant::now(),
+                },
+            );
+        }
+
+        let cookie = format!(
+            "{}={}; HttpOnly; SameSite=Strict; Path=/api; Max-Age={}",
+            AUTH_SESSION_COOKIE, token, state.config.server.session_ttl_secs
+        );
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
+        }
+    }
+
+    response
 }
 
 // Serve UI static files
@@ -1725,7 +1816,7 @@ mod tests {
         api_key: &str,
         bind: &str,
         rate_limit_per_minute: u32,
-    ) -> (tempfile::TempDir, Router) {
+    ) -> (tempfile::TempDir, Arc<AppState>, Router) {
         let mut config = Config::default();
         config.server.bind = bind.to_string();
         config.server.rate_limit_per_minute = rate_limit_per_minute;
@@ -1738,6 +1829,7 @@ mod tests {
             workspace_lock: WorkspaceLock::new().unwrap(),
             api_key: api_key.to_string(),
             rate_limiter: Mutex::new(RateLimiter::new()),
+            auth_sessions: Mutex::new(HashMap::new()),
         });
 
         let api_routes = Router::new()
@@ -1753,14 +1845,17 @@ mod tests {
                 enforce_rate_limit,
             ));
 
-        let public_routes = Router::new().route("/health", get(|| async { "ok" }));
+        let public_routes = Router::new()
+            .route("/", get(serve_ui_index))
+            .route("/health", get(|| async { "ok" }));
 
-        (tmpdir, public_routes.merge(api_routes).with_state(state))
+        let router = public_routes.merge(api_routes).with_state(state.clone());
+        (tmpdir, state, router)
     }
 
     #[tokio::test]
     async fn test_health_no_auth_required() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(Request::get("/health").body(Body::empty()).unwrap())
             .await
@@ -1770,7 +1865,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_requires_auth() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
             .await
@@ -1780,7 +1875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_wrong_key_rejected() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1795,7 +1890,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_correct_bearer_accepted() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
@@ -1810,7 +1905,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_query_param_rejected() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status?api_key=test-key-123")
@@ -1823,12 +1918,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_same_origin_bypasses_auth() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+    async fn test_sec_fetch_site_no_longer_bypasses_auth() {
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
                     .header("Sec-Fetch-Site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_session_cookie_auth_works() {
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
+
+        // Load the index page to get a session cookie
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("index page must set session cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with("lgpt_session="));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Path=/api"));
+
+        // Extract the token value for use in a Cookie header
+        let token = cookie.split(';').next().unwrap().trim();
+
+        // Use the session cookie to access a protected endpoint
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header(header::COOKIE, token)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1838,12 +1973,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sec_fetch_none_requires_auth() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+    async fn test_session_cookie_rejected_when_invalid() {
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
-                    .header("Sec-Fetch-Site", "none")
+                    .header(header::COOKIE, "lgpt_session=forged-token-12345")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1853,12 +1988,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cross_site_requires_auth() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+    async fn test_session_cookie_rejected_when_expired() {
+        let (_tmpdir, state, app) = test_app("test-key-123", "127.0.0.1", 0);
+
+        // Insert an already-expired auth session (use real UUID format)
+        let token = uuid::Uuid::new_v4().to_string();
+        let ttl = Duration::from_secs(state.config.server.session_ttl_secs);
+        {
+            let mut sessions = state.auth_sessions.lock().await;
+            sessions.insert(
+                token.clone(),
+                AuthSession {
+                    last_used: Instant::now() - ttl - Duration::from_secs(1),
+                },
+            );
+        }
+
         let resp = app
             .oneshot(
                 Request::get("/api/status")
-                    .header("Sec-Fetch-Site", "cross-site")
+                    .header(header::COOKIE, format!("lgpt_session={}", token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Expired session should have been removed from the store
+        let sessions = state.auth_sessions.lock().await;
+        assert!(!sessions.contains_key(&token));
+    }
+
+    #[tokio::test]
+    async fn test_bearer_auth_still_works_with_session_changes() {
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header("Authorization", "Bearer test-key-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_session_cookie_not_issued_on_non_loopback() {
+        let (_tmpdir, _state, app) = test_app("test-key-123", "0.0.0.0", 0);
+
+        // Load the index page — should NOT get a session cookie
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(header::SET_COOKIE).is_none(),
+            "must not issue session cookie on non-loopback bind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_cookie_rejected_on_non_loopback() {
+        let (_tmpdir, state, app) = test_app("test-key-123", "0.0.0.0", 0);
+
+        // Manually insert a valid auth session (use real UUID format)
+        let token = uuid::Uuid::new_v4().to_string();
+        {
+            let mut sessions = state.auth_sessions.lock().await;
+            sessions.insert(
+                token.clone(),
+                AuthSession {
+                    last_used: Instant::now(),
+                },
+            );
+        }
+
+        // Cookie should NOT work on non-loopback bind
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header(header::COOKIE, format!("lgpt_session={}", token))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1868,23 +2082,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_same_origin_bypass_rejected_on_non_loopback() {
-        let (_tmpdir, app) = test_app("test-key-123", "0.0.0.0", 0);
+    async fn test_session_cookie_prefix_collision() {
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
+
+        // Get a valid session token
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let token_kv = set_cookie.split(';').next().unwrap().trim();
+
+        // Cookie with a prefix-collision name before the valid cookie
+        let cookie_header = format!("lgpt_session_extra=bogus; {}", token_kv);
         let resp = app
             .oneshot(
                 Request::get("/api/status")
-                    .header("Sec-Fetch-Site", "same-origin")
+                    .header(header::COOKIE, cookie_header)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_session_cookie_with_multiple_cookies() {
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
+
+        // Get a valid session token
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let token_kv = set_cookie.split(';').next().unwrap().trim();
+
+        // Send it alongside other cookies
+        let cookie_header = format!("other=foo; {}; bar=baz", token_kv);
+        let resp = app
+            .oneshot(
+                Request::get("/api/status")
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_rate_limit_enforced() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 2);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 2);
         for _ in 0..2 {
             let resp = app
                 .clone()
@@ -1913,7 +2178,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_rejects_path_traversal() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::post("/api/sessions")
@@ -1929,7 +2194,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_rejects_non_uuid() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::post("/api/sessions")
@@ -1945,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_accepts_valid_uuid() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let uuid = uuid::Uuid::new_v4().to_string();
         let body = format!(r#"{{"session_id":"{}"}}"#, uuid);
         let resp = app
@@ -1968,7 +2233,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_session_accepts_no_id() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::post("/api/sessions")
@@ -1989,7 +2254,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_rejects_path_traversal() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/saved-sessions/..%2F..%2Fetc%2Fpasswd")
@@ -2004,7 +2269,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_rejects_non_uuid() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let resp = app
             .oneshot(
                 Request::get("/api/saved-sessions/some-arbitrary-name")
@@ -2019,7 +2284,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_valid_uuid_not_bad_request() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let uuid = uuid::Uuid::new_v4().to_string();
         let resp = app
             .oneshot(
@@ -2036,7 +2301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_saved_session_resolves_legacy_uppercase_filename() {
-        let (_tmpdir, app) = test_app("test-key-123", "127.0.0.1", 0);
+        let (_tmpdir, _state, app) = test_app("test-key-123", "127.0.0.1", 0);
         let lower = uuid::Uuid::new_v4().to_string();
         let upper = lower.to_uppercase();
 
@@ -2083,6 +2348,7 @@ mod tests {
             workspace_lock: WorkspaceLock::new().unwrap(),
             api_key: "test-key".to_string(),
             rate_limiter: Mutex::new(RateLimiter::new()),
+            auth_sessions: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()

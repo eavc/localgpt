@@ -167,8 +167,12 @@ bind = "127.0.0.1"
 
 # API key for authenticating HTTP requests.
 # Auto-generated on first run if empty. All /api/* endpoints require
-# either a valid Bearer token or a same-origin request from the embedded UI.
+# either a valid Bearer token or a session cookie (issued when loading the UI).
 # api_key = ""
+
+# Session cookie TTL in seconds (default 86400 = 24 hours).
+# Controls both the server-side auth session lifetime and the cookie Max-Age.
+# session_ttl_secs = 86400
 
 [session]
 # Days to keep session transcripts (0 = keep forever, no auto-deletion).

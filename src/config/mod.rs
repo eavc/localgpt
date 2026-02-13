@@ -260,6 +260,11 @@ pub struct ServerConfig {
     /// Auto-generated on first run if empty.
     #[serde(default)]
     pub api_key: String,
+
+    /// Session cookie TTL in seconds (default 86400 = 24 hours).
+    /// Controls both the server-side session lifetime and the cookie Max-Age.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +514,9 @@ fn default_bind() -> String {
 fn default_rate_limit_per_minute() -> u32 {
     120
 }
+fn default_session_ttl_secs() -> u64 {
+    86400 // 24 hours
+}
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -606,6 +614,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             rate_limit_per_minute: default_rate_limit_per_minute(),
             api_key: String::new(),
+            session_ttl_secs: default_session_ttl_secs(),
         }
     }
 }
@@ -724,6 +733,7 @@ impl Config {
                 Ok(self.server.rate_limit_per_minute.to_string())
             }
             ["server", "api_key"] => Ok(self.server.api_key.clone()),
+            ["server", "session_ttl_secs"] => Ok(self.server.session_ttl_secs.to_string()),
             ["memory", "workspace"] => Ok(self.memory.workspace.clone()),
             ["logging", "level"] => Ok(self.logging.level.clone()),
             ["logging", "log_llm_bodies"] => Ok(self.logging.log_llm_bodies.to_string()),
@@ -754,6 +764,7 @@ impl Config {
                 self.server.rate_limit_per_minute = value.parse()?
             }
             ["server", "api_key"] => self.server.api_key = value.to_string(),
+            ["server", "session_ttl_secs"] => self.server.session_ttl_secs = value.parse()?,
             ["memory", "workspace"] => self.memory.workspace = value.to_string(),
             ["logging", "level"] => self.logging.level = value.to_string(),
             ["logging", "log_llm_bodies"] => self.logging.log_llm_bodies = value.parse()?,
@@ -900,6 +911,8 @@ bind = "127.0.0.1"
 # rate_limit_per_minute = 120
 # API key for authenticating HTTP requests (auto-generated if empty)
 # api_key = ""
+# Session cookie TTL in seconds (default 86400 = 24 hours)
+# session_ttl_secs = 86400
 
 [session]
 # Days to keep session transcripts (0 = keep forever, no auto-deletion).
