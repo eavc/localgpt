@@ -7,17 +7,51 @@ use super::policy::{SandboxLevel, SandboxPolicy};
 ///
 /// argv layout:
 ///   argv[0] = "localgpt-sandbox" (already consumed by dispatch)
-///   argv[1] = SandboxPolicy JSON
-///   argv[2] = shell command to execute
+///   argv[1] = shell command to execute
+///
+/// Policy is read from stdin (JSON). This avoids leaking sandbox
+/// configuration through /proc/<pid>/cmdline. See SEC-20b.
 pub fn sandbox_child_main() -> ! {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 3 {
-        eprintln!("localgpt-sandbox: expected policy JSON and command arguments");
+    if args.len() < 2 {
+        eprintln!("localgpt-sandbox: expected command argument");
         std::process::exit(1);
     }
 
-    let policy: SandboxPolicy = match serde_json::from_str(&args[1]) {
+    // Read policy JSON from stdin (closed by parent after write).
+    // Cap at 64 KiB to prevent memory exhaustion from malicious input.
+    // Valid policies are < 4 KiB in practice.
+    const MAX_POLICY_BYTES: u64 = 64 * 1024;
+    let policy_json = {
+        use std::io::Read;
+        let mut buf = String::new();
+        let bytes_read = match std::io::stdin()
+            .take(MAX_POLICY_BYTES)
+            .read_to_string(&mut buf)
+        {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("localgpt-sandbox: failed to read policy from stdin: {}", e);
+                std::process::exit(1);
+            }
+        };
+        // `>=` is intentional: `Take` reads at most MAX_POLICY_BYTES, so
+        // we cannot distinguish "exactly MAX_POLICY_BYTES" from "truncated
+        // at MAX_POLICY_BYTES". Fail-closed: reject anything that *might*
+        // have been truncated. This is safe because valid policies are well
+        // below 64 KiB.
+        if bytes_read as u64 >= MAX_POLICY_BYTES {
+            eprintln!(
+                "localgpt-sandbox: policy JSON too large (read {} bytes, limit {})",
+                bytes_read, MAX_POLICY_BYTES
+            );
+            std::process::exit(1);
+        }
+        buf
+    };
+
+    let policy: SandboxPolicy = match serde_json::from_str(&policy_json) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("localgpt-sandbox: failed to parse policy: {}", e);
@@ -25,7 +59,7 @@ pub fn sandbox_child_main() -> ! {
         }
     };
 
-    let command = &args[2];
+    let command = &args[1];
 
     // Apply resource limits first (works on all platforms)
     if let Err(e) = apply_rlimits(&policy) {

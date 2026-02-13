@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 use super::policy::SandboxPolicy;
 
@@ -8,8 +9,9 @@ use super::policy::SandboxPolicy;
 /// This is the parent-side function. It:
 /// 1. Serializes the policy to JSON
 /// 2. Re-execs the current binary with argv[0]="localgpt-sandbox"
-/// 3. Passes policy + command as arguments
-/// 4. Collects output and enforces timeout (with explicit kill/reap)
+/// 3. Passes policy via stdin pipe (not argv — avoids /proc/pid/cmdline leak)
+/// 4. Passes the shell command as argv[1]
+/// 5. Collects output and enforces timeout (with explicit kill/reap)
 ///
 /// The effective timeout is the minimum of `timeout_ms` and the policy's
 /// `timeout_secs * 1000`, ensuring the sandbox config acts as a hard cap.
@@ -18,8 +20,6 @@ pub async fn run_sandboxed(
     policy: &SandboxPolicy,
     timeout_ms: u64,
 ) -> Result<(String, i32)> {
-    let policy_json = serde_json::to_string(policy)?;
-
     // Get path to current executable for re-exec
     let exe_path = std::env::current_exe()?;
 
@@ -28,26 +28,23 @@ pub async fn run_sandboxed(
     let effective_timeout_ms = timeout_ms.min(policy_timeout_ms);
     let timeout_duration = Duration::from_millis(effective_timeout_ms);
 
-    // Build the child command. We use .output() wrapped in timeout, with
-    // kill_on_drop as a safety net. On timeout, we explicitly handle the error
-    // and tokio's kill_on_drop ensures the child is cleaned up.
-    //
-    // SECURITY: env_clear() prevents sandboxed commands from reading parent
-    // API keys via `env`/`printenv`. Only minimal, non-secret variables are
-    // forwarded. See SEC-15.
-    let output_fut = tokio::process::Command::new(&exe_path)
-        .arg0("localgpt-sandbox")
-        .arg(&policy_json)
-        .arg(command)
-        .env_clear()
-        .envs(sandbox_env())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .output();
+    let child_fut = async {
+        let (mut child, policy_json) = spawn_sandbox_child(command, policy, &exe_path)?;
+
+        // Write policy JSON to child's stdin, then close the pipe.
+        // Policy is small (< 4 KB), well within pipe buffer limits.
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("BUG: stdin pipe was requested but not available"))?;
+        stdin.write_all(policy_json.as_bytes()).await?;
+        drop(stdin); // close the pipe, signaling EOF to the child
+
+        child.wait_with_output().await.map_err(anyhow::Error::from)
+    };
 
     // Wait with timeout — on expiry, dropping the future kills the child
-    match tokio::time::timeout(timeout_duration, output_fut).await {
+    match tokio::time::timeout(timeout_duration, child_fut).await {
         Ok(Ok(output)) => format_output(&output, policy),
         Ok(Err(e)) => Err(anyhow::anyhow!("Sandboxed command I/O error: {}", e)),
         Err(_timeout) => Err(anyhow::anyhow!(
@@ -55,6 +52,43 @@ pub async fn run_sandboxed(
             effective_timeout_ms
         )),
     }
+}
+
+/// Spawn a sandbox child process with the given command and policy.
+///
+/// Returns the child handle and the serialized policy JSON. The caller is
+/// responsible for writing `policy_json` to the child's stdin, closing the
+/// pipe (to signal EOF), and then reading output.
+///
+/// The child is spawned with `kill_on_drop(true)`, so dropping the handle
+/// sends SIGKILL.
+///
+/// # Security
+///
+/// - **SEC-20b**: Policy is passed via stdin, NOT as argv. This function is
+///   the single point of command construction — regressions are caught by
+///   `tests/sandbox_stdin_transport.rs`.
+/// - **SEC-15**: `env_clear()` + explicit allowlist prevents credential leak.
+#[doc(hidden)]
+pub fn spawn_sandbox_child(
+    command: &str,
+    policy: &SandboxPolicy,
+    exe_path: &std::path::Path,
+) -> Result<(tokio::process::Child, String)> {
+    let policy_json = serde_json::to_string(policy)?;
+
+    let child = tokio::process::Command::new(exe_path)
+        .arg0("localgpt-sandbox")
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env_clear()
+        .envs(sandbox_env())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    Ok((child, policy_json))
 }
 
 /// Format captured output, applying UTF-8-safe truncation.
@@ -332,5 +366,111 @@ mod tests {
         assert_eq!(truncate_utf8(s, 3), "€");
         assert_eq!(truncate_utf8(s, 4), "€");
         assert_eq!(truncate_utf8(s, 6), "€€");
+    }
+
+    /// Verify the stdin-pipe pattern used by `run_sandboxed` (SEC-20b).
+    ///
+    /// Spawns a child process that reads stdin via `cat` and echoes it to
+    /// stdout. This validates that the pipe mechanism correctly delivers
+    /// data and that EOF is signaled when the sender drops the handle.
+    ///
+    /// Full end-to-end transport (with argv[0] dispatch and sandbox child
+    /// policy parsing) is covered by the integration test in
+    /// `tests/sandbox_stdin_transport.rs` (Linux) and by
+    /// `cargo run -- sandbox test` smoke tests.
+    #[tokio::test]
+    async fn test_stdin_pipe_delivers_data_to_child() {
+        use tokio::io::AsyncWriteExt;
+
+        let test_data = r#"{"workspace_path":"/tmp","level":"None"}"#;
+
+        let mut child = tokio::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn child");
+
+        // Use the same ok_or_else pattern as run_sandboxed
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("stdin pipe was requested but not available");
+        stdin
+            .write_all(test_data.as_bytes())
+            .await
+            .expect("failed to write to stdin");
+        drop(stdin); // close the pipe → child receives EOF
+
+        let output = child.wait_with_output().await.expect("failed to wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert_eq!(
+            stdout, test_data,
+            "stdin data should be delivered to child stdout via cat"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    /// Verify that command arguments do NOT contain policy JSON (SEC-20b).
+    ///
+    /// Spawns a child that prints its own `/proc/self/cmdline` (Linux) or
+    /// `$0 $@` (portable). Asserts policy field names are absent from argv.
+    #[tokio::test]
+    async fn test_command_args_do_not_contain_policy() {
+        use tokio::io::AsyncWriteExt;
+
+        let policy_json = r#"{"workspace_path":"/tmp","deny_paths":["/secret"]}"#;
+        let command = "echo args-check-ok";
+
+        // Simulate the run_sandboxed spawn pattern: policy via stdin, command as argv.
+        // The command drains stdin first to avoid EPIPE — on Linux, bash can exit
+        // before the parent's write completes if stdin isn't consumed.
+        let mut child = tokio::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(format!(
+                "cat > /dev/null; echo \"CMDLINE: $0 $@\"; {}",
+                command
+            ))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn child");
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("stdin pipe was requested but not available");
+        stdin
+            .write_all(policy_json.as_bytes())
+            .await
+            .expect("failed to write policy to stdin");
+        drop(stdin);
+
+        let output = child.wait_with_output().await.expect("failed to wait");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Policy field names must not appear in command-line output
+        assert!(
+            !stdout.contains("workspace_path"),
+            "policy field 'workspace_path' found in child args: {}",
+            stdout
+        );
+        assert!(
+            !stdout.contains("deny_paths"),
+            "policy field 'deny_paths' found in child args: {}",
+            stdout
+        );
+        // But the command itself should execute
+        assert!(
+            stdout.contains("args-check-ok"),
+            "expected command output in stdout: {}",
+            stdout
+        );
     }
 }

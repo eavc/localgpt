@@ -141,6 +141,46 @@ pub(super) fn dirs_home() -> PathBuf {
         })
 }
 
+/// Check if a path is `/proc` or any subtree under it.
+///
+/// `/proc` exposes `/proc/self/environ` (parent process's full environment
+/// including API keys), `/proc/<pid>/cmdline`, and other sensitive kernel
+/// state. User-configured allow_paths must never grant access to it.
+/// See SEC-15.
+///
+/// Handles non-canonical forms (`//proc`, `/./proc`, `/proc/../proc/self`)
+/// and symlinks (via `canonicalize()` for paths that exist on disk).
+fn is_proc_path(candidate: &std::path::Path) -> bool {
+    // Try filesystem-level resolution first (follows symlinks).
+    // Fall back to lexical normalization for non-existent paths.
+    let normalized = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_normalize(candidate));
+    let s = normalized.to_string_lossy();
+    s == "/proc" || s.starts_with("/proc/")
+}
+
+/// Lexical path normalization: collapse `.`, `..`, and redundant separators
+/// without touching the filesystem.
+///
+/// Root-stable for absolute paths: `PathBuf::pop()` on root `/` is a no-op
+/// (returns false), so repeated `..` cannot escape above root.
+/// E.g. `/../../../proc` normalizes to `/proc`.
+fn lexical_normalize(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {} // skip `.`
+            Component::ParentDir => {
+                result.pop(); // no-op at root — cannot escape above /
+            }
+            other => result.push(other),
+        }
+    }
+    result
+}
+
 /// Check if a candidate path overlaps any deny path.
 ///
 /// An "overlap" means the candidate is an ancestor of (or equal to) a deny path,
@@ -189,14 +229,20 @@ pub fn build_policy(
     for p in &config.allow_paths.read {
         let expanded = shellexpand::tilde(p);
         let candidate = PathBuf::from(expanded.to_string());
-        if !overlaps_deny_path(&candidate, &deny_paths) {
-            read_only.push(candidate);
-        } else {
+        if is_proc_path(&candidate) {
+            eprintln!(
+                "localgpt-sandbox: WARNING: ignoring allow_paths.read entry {:?} — \
+                 /proc access is denied (credential leak risk, see SEC-15)",
+                p
+            );
+        } else if overlaps_deny_path(&candidate, &deny_paths) {
             eprintln!(
                 "localgpt-sandbox: WARNING: ignoring allow_paths.read entry {:?} — \
                  it overlaps a credential deny path",
                 p
             );
+        } else {
+            read_only.push(candidate);
         }
     }
 
@@ -204,14 +250,20 @@ pub fn build_policy(
     for p in &config.allow_paths.write {
         let expanded = shellexpand::tilde(p);
         let candidate = PathBuf::from(expanded.to_string());
-        if !overlaps_deny_path(&candidate, &deny_paths) {
-            extra_write.push(candidate);
-        } else {
+        if is_proc_path(&candidate) {
+            eprintln!(
+                "localgpt-sandbox: WARNING: ignoring allow_paths.write entry {:?} — \
+                 /proc access is denied (credential leak risk, see SEC-15)",
+                p
+            );
+        } else if overlaps_deny_path(&candidate, &deny_paths) {
             eprintln!(
                 "localgpt-sandbox: WARNING: ignoring allow_paths.write entry {:?} — \
                  it overlaps a credential deny path",
                 p
             );
+        } else {
+            extra_write.push(candidate);
         }
     }
 
@@ -372,6 +424,120 @@ mod tests {
         assert!(
             !has_proc_self,
             "default_read_only_paths must not include /proc/self (credential leak via /proc/self/environ)"
+        );
+    }
+
+    #[test]
+    fn test_is_proc_path_exact() {
+        assert!(is_proc_path(std::path::Path::new("/proc")));
+    }
+
+    #[test]
+    fn test_is_proc_path_subtree() {
+        assert!(is_proc_path(std::path::Path::new("/proc/self")));
+        assert!(is_proc_path(std::path::Path::new("/proc/self/environ")));
+        assert!(is_proc_path(std::path::Path::new("/proc/1/cmdline")));
+    }
+
+    #[test]
+    fn test_is_proc_path_non_canonical() {
+        // Double slash
+        assert!(is_proc_path(std::path::Path::new("//proc")));
+        assert!(is_proc_path(std::path::Path::new("//proc/self")));
+        // Dot component
+        assert!(is_proc_path(std::path::Path::new("/./proc")));
+        assert!(is_proc_path(std::path::Path::new("/./proc/self/environ")));
+        // Parent traversal back into /proc
+        assert!(is_proc_path(std::path::Path::new("/proc/../proc/self")));
+    }
+
+    #[test]
+    fn test_is_proc_path_negative() {
+        assert!(!is_proc_path(std::path::Path::new("/usr")));
+        assert!(!is_proc_path(std::path::Path::new("/tmp")));
+        assert!(!is_proc_path(std::path::Path::new("/procfs")));
+        assert!(!is_proc_path(std::path::Path::new("/home/proc")));
+    }
+
+    #[test]
+    fn test_lexical_normalize_root_stable() {
+        // Repeated `..` from root must not escape above `/`.
+        // PathBuf::pop() on root is a no-op, so this normalizes to `/proc`.
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/../../../proc")),
+            PathBuf::from("/proc")
+        );
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/../../proc/self")),
+            PathBuf::from("/proc/self")
+        );
+        // Normal absolute path passes through unchanged
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/usr/local/bin")),
+            PathBuf::from("/usr/local/bin")
+        );
+        // Dot and double-slash collapse
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/./usr//local")),
+            PathBuf::from("/usr/local")
+        );
+    }
+
+    #[test]
+    fn test_allow_paths_read_proc_is_rejected() {
+        let mut config = SandboxConfig::default();
+        config.allow_paths.read.push("/proc".to_string());
+
+        let workspace = PathBuf::from("/tmp/test");
+        let policy = build_policy(&config, &workspace, SandboxLevel::Standard);
+
+        assert!(
+            !policy.read_only_paths.iter().any(|p| is_proc_path(p)),
+            "/proc must not appear in read_only_paths"
+        );
+    }
+
+    #[test]
+    fn test_allow_paths_read_proc_subtree_is_rejected() {
+        let mut config = SandboxConfig::default();
+        config.allow_paths.read.push("/proc/self".to_string());
+        config.allow_paths.read.push("/proc/1/environ".to_string());
+
+        let workspace = PathBuf::from("/tmp/test");
+        let policy = build_policy(&config, &workspace, SandboxLevel::Standard);
+
+        assert!(
+            !policy.read_only_paths.iter().any(|p| is_proc_path(p)),
+            "/proc subtree must not appear in read_only_paths"
+        );
+    }
+
+    #[test]
+    fn test_allow_paths_write_proc_is_rejected() {
+        let mut config = SandboxConfig::default();
+        config.allow_paths.write.push("/proc".to_string());
+        config.allow_paths.write.push("/proc/self".to_string());
+
+        let workspace = PathBuf::from("/tmp/test");
+        let policy = build_policy(&config, &workspace, SandboxLevel::Standard);
+
+        assert!(
+            !policy.extra_write_paths.iter().any(|p| is_proc_path(p)),
+            "/proc must not appear in extra_write_paths"
+        );
+    }
+
+    #[test]
+    fn test_allow_paths_non_proc_still_accepted() {
+        let mut config = SandboxConfig::default();
+        config.allow_paths.read.push("/opt/data".to_string());
+
+        let workspace = PathBuf::from("/tmp/test");
+        let policy = build_policy(&config, &workspace, SandboxLevel::Standard);
+
+        assert!(
+            policy.read_only_paths.contains(&PathBuf::from("/opt/data")),
+            "non-/proc path should be accepted in read_only_paths"
         );
     }
 
