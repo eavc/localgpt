@@ -4,6 +4,28 @@
 
 ### Security
 
+A comprehensive two-phase security audit was performed, covering all tool
+execution paths, the HTTP server, session management, sandbox enforcement,
+and the web UI. All findings have been resolved.
+
+#### File tools sandboxed to prevent unrestricted filesystem access (SEC-01)
+
+File tools (`read_file`, `write_file`, `edit_file`) now validate all paths
+against a `PathSandbox` before any I/O. Paths are canonicalized to resolve
+symlinks and `..` traversal, then checked against allowed roots (workspace
+directory plus any `tools.allowed_paths` entries from config).
+
+`memory_get` also received defense-in-depth fixes: component-based `..`
+rejection and post-canonicalization containment checks prevent traversal
+via prefixed paths like `memory/../../etc/passwd`.
+
+Configure additional allowed directories in `config.toml`:
+
+```toml
+[tools]
+allowed_paths = ["/tmp/localgpt", "~/projects"]
+```
+
 #### API key auth and CORS restriction for HTTP server (SEC-02)
 
 The HTTP server previously exposed all API endpoints with no authentication
@@ -11,16 +33,110 @@ and wildcard CORS (`allow_origin(Any)`), allowing any website to silently
 call the API via JavaScript.
 
 Changes:
-- All `/api/*` routes now require a bearer token (`Authorization: Bearer <key>`)
-  or a valid `api_key` query parameter. The embedded web UI bypasses auth
-  automatically via `Sec-Fetch-Site: same-origin` (loopback bind only).
+- All `/api/*` routes now require a bearer token (`Authorization: Bearer <key>`).
+  The embedded web UI authenticates via a session cookie issued on page load
+  (loopback bind only).
 - CORS restricted to `localhost:<port>` origins only (was `Any`).
 - API key auto-generated (UUID v4) on first run and persisted to config.
 - Non-loopback bind address triggers a warning log.
 - Rate limiting added: configurable via `server.rate_limit_per_minute`
   (default 120 requests/minute, 0 = unlimited).
 
-#### Kernel-enforced shell sandbox for bash tool (localgpt-359)
+#### Tool approval enforcement in non-interactive contexts (SEC-03)
+
+Tools now require explicit approval in non-interactive contexts (daemon,
+heartbeat). Desktop GUI approval flow wired up with a confirmation dialog.
+
+#### Heartbeat tool restrictions (SEC-04)
+
+Heartbeat mode restricts tool access to a safe subset. File operations are
+sandboxed to the workspace via `PathSandbox::new_heartbeat` with symlink
+defense.
+
+#### SSRF and data exfiltration prevention in web_fetch (SEC-06, SEC-18)
+
+`web_fetch` validates URLs against a private-IP blocklist (RFC 1918/4193,
+link-local, loopback, and cloud metadata endpoints). DNS resolution is
+pinned at validation time to prevent TOCTOU/rebinding attacks — each
+request builds a per-URL client with `resolve_to_addrs()` using
+pre-validated addresses. Redirect hops re-validate and re-pin at each hop.
+Fail-closed guard when pinned addresses are present but the URL has no host.
+
+#### Content delimiter spoofing prevention (SEC-07)
+
+Tool output sanitization now detects and neutralizes delimiter token
+spoofing in content delimiters.
+
+#### Session ID path traversal prevention (SEC-08)
+
+Session IDs are validated as UUIDs before use in filesystem paths,
+preventing directory traversal via crafted session identifiers.
+
+#### Safe SQLite extension loading (SEC-09)
+
+Replaced unsafe `load_extension` with in-process `sqlite-vec`
+initialization, eliminating the extension loading attack surface.
+
+#### LLM body logging gated behind config (SEC-10)
+
+Full LLM request/response body logging is now gated behind a config flag
+and requires TRACE log level, preventing accidental exposure of sensitive
+content in production logs.
+
+#### Session retention and purge (SEC-11)
+
+Session files are purged after a configurable retention period. Stale
+entries in `sessions.json` are automatically pruned after session file
+purge, with crash-recovery safety.
+
+#### Memory content sanitization (SEC-12)
+
+Memory content loaded into `build_memory_context` is sanitized to prevent
+prompt injection via stored memory files.
+
+#### External provider data egress warnings (SEC-13)
+
+Runtime and config-time warnings when data is sent to external LLM
+providers. Centralized egress classifier in `src/config/egress.rs` with
+warnings surfaced in both the web and desktop UIs.
+
+#### Sandbox credential exfiltration channels closed (SEC-15)
+
+Sandboxed processes now start with a cleared environment (`env_clear()`)
+and a minimal allowlist of safe variables. `/proc/self` removed from
+Linux read-only sandbox paths to prevent credential harvesting via
+`/proc/self/environ`.
+
+#### Sandbox fail-closed enforcement (SEC-16)
+
+When the sandbox is enabled but the platform lacks kernel support (e.g.,
+old Linux kernel without Landlock), execution is now refused rather than
+silently falling back to unsandboxed mode. `SandboxEnforcement` enum
+(Active/FailClosed/Disabled) replaces the previous optional wrapper.
+Daemon startup banner shows enforcement status.
+
+#### Session-token cookie auth replacing Sec-Fetch-Site (SEC-17)
+
+Removed query-parameter API key auth fallback and Sec-Fetch-Site header
+trust. The web UI now authenticates via `HttpOnly; SameSite=Strict`
+session cookies issued on page load (loopback only). Configurable session
+TTL via `server.session_ttl_secs` (default 86400). In-memory session store
+with periodic cleanup and 1000-session cap.
+
+#### XSS prevention in web UI (SEC-19)
+
+Applied `escapeHtml()` to all dynamic-value `innerHTML` sinks in the
+embedded web UI.
+
+#### Sandbox policy transport via stdin (SEC-20)
+
+Sandbox policy is now passed to child processes via stdin pipe instead of
+command-line arguments, preventing policy field exposure in
+`/proc/<pid>/cmdline`. API key prefix removed from daemon startup banner.
+`/proc` entries rejected from sandbox `allow_paths` to prevent
+re-introduction of credential exfiltration paths.
+
+#### Kernel-enforced shell sandbox for bash tool
 
 Shell commands executed by the `bash` tool now run inside a kernel-enforced
 sandbox. On Linux, Landlock LSM restricts filesystem access (workspace +
@@ -46,23 +162,10 @@ Credential directories (`~/.ssh`, `~/.aws`, `~/.gnupg`, etc.) are always
 denied. User-provided `allow_paths` that overlap credential directories
 are automatically pruned.
 
-#### File tools sandboxed to prevent unrestricted filesystem access (SEC-01)
+### Changed
 
-File tools (`read_file`, `write_file`, `edit_file`) now validate all paths
-against a `PathSandbox` before any I/O. Paths are canonicalized to resolve
-symlinks and `..` traversal, then checked against allowed roots (workspace
-directory plus any `tools.allowed_paths` entries from config).
-
-`memory_get` also received defense-in-depth fixes: component-based `..`
-rejection and post-canonicalization containment checks prevent traversal
-via prefixed paths like `memory/../../etc/passwd`.
-
-Configure additional allowed directories in `config.toml`:
-
-```toml
-[tools]
-allowed_paths = ["/tmp/localgpt", "~/projects"]
-```
+- CI now runs on both `main` and `development` branches, with an explicit
+  step for Linux-only SEC-20b integration tests (`sandbox_stdin_transport`).
 
 ### Fixed
 

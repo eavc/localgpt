@@ -25,6 +25,54 @@ cargo install localgpt
 cargo install localgpt --no-default-features
 ```
 
+## Compiling from Source
+
+Requires Rust 1.75+ (2021 edition). On Linux, a few system packages are
+needed for the desktop GUI and TLS.
+
+```bash
+# Clone the repository
+git clone https://github.com/localgpt-app/localgpt.git
+cd localgpt
+
+# Build (debug)
+cargo build
+
+# Build (release — optimized, ~27MB binary)
+cargo build --release
+
+# Headless build (no desktop GUI — skips X11/Wayland dependencies)
+cargo build --release --no-default-features
+
+# Run tests
+cargo test
+
+# Install locally from source
+cargo install --path .
+```
+
+### Linux dependencies
+
+The desktop GUI (eframe/egui) requires X11 or Wayland development
+libraries. On Debian/Ubuntu:
+
+```bash
+# For X11
+sudo apt install libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+# For Wayland
+sudo apt install libwayland-dev libxkbcommon-dev
+```
+
+Skip these for headless builds (`--no-default-features`).
+
+### Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `desktop` | yes | Desktop GUI via eframe/egui |
+| `gguf` | no | GGUF embedding models via llama.cpp (requires C++ compiler) |
+
 ## Quick Start
 
 ```bash
